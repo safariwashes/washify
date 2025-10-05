@@ -401,3 +401,7 @@ def latest_s3_object(prefix: str, file_match: str) -> Optional[dict]:
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if file_match in os.path.basename(key):
+                if newest is None or obj["LastModified"] > newest["LastModified"]:
+                    newest = obj
+    return newest
+
