@@ -27,10 +27,11 @@ except Exception:
 # ===================== CONFIG =====================
 AWS_REGION  = os.getenv("AWS_REGION", "us-east-2")
 S3_BUCKET   = os.getenv("S3_BUCKET", "safari-franklin-data")
-S3_PREFIX   = os.getenv("S3_PREFIX", "kiosks/")
+S3_PREFIX   = os.getenv("S3_PREFIX", "kiosks/")  # e.g. kiosks/ or kiosks/kiosk1/
 FILE_MATCH  = os.getenv("FILE_MATCH", "Transaction")
 
-INPUT_PATH = os.getenv("INPUT_PATH")  # optional local override
+# Local override for testing: if set, S3 is ignored
+INPUT_PATH = os.getenv("INPUT_PATH")  # file or folder
 
 def get_conn():
     return psycopg2.connect(
@@ -66,7 +67,8 @@ PAYMENT_TYPE_RE = re.compile(r"Payment Type\s+([A-Za-z]+)", re.IGNORECASE)
 AWS_FILE_RE = re.compile(r"Aws File Name\s+(.+)$", re.IGNORECASE)
 LICENSE_PLATE_RE = re.compile(r"(?:License Plate|LICENSE PLATE)\s+([A-Z0-9]+)", re.IGNORECASE)
 CUSTOMER_NAME_RE = re.compile(r"Customer Name\s+([^,]+)", re.IGNORECASE)
-UNLIMITED_NEW_RE = re.compile(r"NEW CUSTOMER\s*->", re.IGNORECASE)
+
+UNLIMITED_NEW_RE  = re.compile(r"NEW CUSTOMER\s*->", re.IGNORECASE)
 UNLIMITED_RECUR_RE = re.compile(r"RECURRING\s*->", re.IGNORECASE)
 
 TIP_HEAD_RE = re.compile(r"^\s*TIP\b", re.IGNORECASE)
@@ -128,10 +130,12 @@ def safe_float(s: Optional[str]) -> Optional[float]:
 
 # ===================== PARSER =====================
 def parse_file(path: Path) -> List[Dict[str, Any]]:
+    """
+    We emit one row per completed session (ended by ReturnToMainScreen OR ResetTransaction).
+    """
     location = infer_location_from_filename(path)
     sessions = []
     sess = None
-    session_counter = 0
 
     def new_session(ts: Optional[datetime]):
         return {
@@ -145,35 +149,38 @@ def parse_file(path: Path) -> List[Dict[str, Any]]:
             "payment_type": None,
             "payment_type_ts": None,
             "image_path": None,
-            "is_unlimited": False,
-            "unlimited_type": None,
+
+            # unlimited markers
+            "is_unlimited": False,        # final: computed later (strong signals)
+            "unlimited_type": None,       # "NEW" | "RECURRING"
             "unlimited_ts": None,
+
+            # add-ons
             "addon_map": {},
             "addons": [],
+
+            # money
             "tip_amount": 0.0,
             "tip_ts": None,
             "discount_code": None,
             "discount_amount": None,
             "tax": None,
             "total": None,
+
+            # strong signal flags (NEW)
+            "saw_unlimited_signature": False,   # UnlimitedCustomerSignatureViewModel
+            "saw_creditcard_unlimited": False,  # CreditCardUnlimitedViewModel
+            "saw_unlimited_pkg_name": False,    # package name contains 'Unlimited'
         }
 
     def end_session(ts: Optional[datetime]):
-        nonlocal sess, session_counter
+        nonlocal sess
         if not sess:
             return
         if ts and (not sess["last_ts"] or ts > sess["last_ts"]):
             sess["last_ts"] = ts
-        sessions.append({**sess, "session_index": session_counter})
+        sessions.append(sess)
         sess = None
-        session_counter += 1
-
-    def set_unlimited(flag_type: str, ts: Optional[datetime]):
-        if (not sess["unlimited_ts"]) or (ts and ts >= sess["unlimited_ts"]) or (flag_type == "RECURRING"):
-            sess["is_unlimited"] = True
-            if (flag_type == "RECURRING") or (sess["unlimited_type"] is None):
-                sess["unlimited_type"] = flag_type
-            sess["unlimited_ts"] = ts or sess["unlimited_ts"]
 
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for raw in f:
@@ -191,7 +198,7 @@ def parse_file(path: Path) -> List[Dict[str, Any]]:
                 if not sess["last_ts"] or ts > sess["last_ts"]:
                     sess["last_ts"] = ts
 
-            # Invoice detection
+            # ----- Invoice detection (first non-zero invoice wins for this session) -----
             for regex in [INVOICE_INLINE_PAY_RE, DO_TXN_RE, PROCEED_INVOICE_RE,
                           INVOICE_ANY_RE, INVOICE_FROM_AWS_RE]:
                 m = regex.search(content)
@@ -200,46 +207,67 @@ def parse_file(path: Path) -> List[Dict[str, Any]]:
                     if inv != "0":
                         sess["invoice"] = inv
 
-            # Unlimited flags
+            # ----- Unlimited markers -----
+            # "NEW CUSTOMER ->" is only a tentative hint, don't force unlimited
             if UNLIMITED_NEW_RE.search(content):
-                set_unlimited("NEW", ts)
-            if UNLIMITED_RECUR_RE.search(content):
-                set_unlimited("RECURRING", ts)
+                if not sess["unlimited_type"]:
+                    sess["unlimited_type"] = "NEW"
+                sess["unlimited_ts"] = ts or sess["unlimited_ts"]
 
-            # Customer & Plate
+            # "RECURRING ->" is strong: set unlimited_type
+            if UNLIMITED_RECUR_RE.search(content):
+                sess["unlimited_type"] = "RECURRING"
+                sess["unlimited_ts"] = ts or sess["unlimited_ts"]
+
+            # Strong screens for signup flow
+            if "UnlimitedCustomerSignatureViewModel" in content:
+                sess["saw_unlimited_signature"] = True
+            if "CreditCardUnlimitedViewModel" in content:
+                sess["saw_creditcard_unlimited"] = True
+
+            # ----- Customer & Plate -----
             m = CUSTOMER_NAME_RE.search(content)
             if m and not sess["customer_name"]:
                 name = re.sub(r"\s{2,}", " ", m.group(1).strip())
-                sess["customer_name"] = name
+                sess["customer_name"] = name or sess["customer_name"]
 
             m = LICENSE_PLATE_RE.search(content)
             if m and not sess["license_plate"]:
                 sess["license_plate"] = m.group(1).strip().upper()
 
-            # Wash package
+            # ----- MAIN package selection -----
             if "ServiceControlViewModel" in content and "SelectServiceBlock" in content:
                 m = WASH_PKG_RE.search(content)
                 if m:
-                    pkg_id, pkg_name = m.group(1).strip(), m.group(2).strip().rstrip(".")
+                    pkg_id = m.group(1).strip()
+                    pkg_name = m.group(2).strip().rstrip(".")
                     if not is_tip_text(pkg_name):
                         sess["wash_package_id"] = pkg_id
                         sess["wash_package_name"] = pkg_name
+                        if "UNLIMITED" in (pkg_name or "").upper():
+                            sess["saw_unlimited_pkg_name"] = True
 
-            # Add-ons
+            # ----- Add-ons (keep latest by package id) -----
             if "SelectOptionalServiceBlock" in content:
                 m = WASH_PKG_RE.search(content)
                 if m:
-                    add_pkg_id, add_name = m.group(1).strip(), m.group(2).strip().rstrip(".")
+                    add_pkg_id = m.group(1).strip()
+                    add_name = m.group(2).strip().rstrip(".")
                     if add_name:
                         if add_pkg_id != sess["wash_package_id"] and add_name != (sess["wash_package_name"] or ""):
                             sess["addon_map"][add_pkg_id] = {"name": add_name, "ts": ts}
-                            amt = tip_amount_from_text(add_name)
-                            if amt > 0:
-                                if (sess["tip_ts"] is None) or (ts and ts >= sess["tip_ts"]):
+                            # Tip detection from addon label
+                            m_tip = TIP_AMOUNT_RE.search(add_name)
+                            if m_tip:
+                                try:
+                                    amt = float(m_tip.group(1))
+                                except Exception:
+                                    amt = 0.0
+                                if amt > 0 and (sess["tip_ts"] is None or (ts and ts >= sess["tip_ts"])):
                                     sess["tip_amount"] = amt
                                     sess["tip_ts"] = ts
 
-            # Payment
+            # ----- Payment (alternate) -----
             if "SaveTransactions" in content and "SaveTransaction" in content:
                 m = PAYMENT_TYPE_RE.search(content)
                 if m:
@@ -248,26 +276,42 @@ def parse_file(path: Path) -> List[Dict[str, Any]]:
                         sess["payment_type"] = ptype
                         sess["payment_type_ts"] = ts
 
-            # Image path
+            # ----- Image path -----
             m = AWS_FILE_RE.search(content)
             if m and not sess["image_path"]:
                 sess["image_path"] = m.group(1).strip()
 
-            # Discount / Tax / Total
-            for regex, attr in [(DISCOUNT_BOTH_RE, "discount_amount"),
-                                (DISCOUNT_AMOUNT_RE, "discount_amount"),
-                                (TAX_RE, "tax"),
-                                (TOTAL_RE, "total")]:
-                m = regex.search(content)
-                if m:
-                    if attr == "discount_amount":
-                        sess["discount_amount"] = safe_float(m.groups()[-1])
-                    elif attr == "tax":
-                        sess["tax"] = safe_float(m.group(1))
-                    elif attr == "total":
-                        sess["total"] = safe_float(m.group(1))
+            # ----- Discount / Tax / Total (last wins) -----
+            m = DISCOUNT_BOTH_RE.search(content)
+            if m:
+                sess["discount_code"] = m.group(1)
+                try:
+                    sess["discount_amount"] = float(m.group(2))
+                except Exception:
+                    pass
+            m = DISCOUNT_CODE_RE.search(content)
+            if m:
+                sess["discount_code"] = m.group(1)
+            m = DISCOUNT_AMOUNT_RE.search(content)
+            if m:
+                try:
+                    sess["discount_amount"] = float(m.group(1))
+                except Exception:
+                    pass
+            m = TAX_RE.search(content)
+            if m:
+                try:
+                    sess["tax"] = float(m.group(1))
+                except Exception:
+                    pass
+            m = TOTAL_RE.search(content)
+            if m:
+                try:
+                    sess["total"] = float(m.group(1))
+                except Exception:
+                    pass
 
-            # End markers
+            # ----- End markers (hard cut) -----
             if ("ProceedToCarWashViewModel" in content and "ReturnToMainScreen" in content) or \
                ("TransactionMethods" in content and "ResetTransaction" in content):
                 end_session(ts)
@@ -278,34 +322,44 @@ def parse_file(path: Path) -> List[Dict[str, Any]]:
         if not s["invoice"] or s["invoice"] == "0":
             continue
 
+        # Flatten add-ons in time order
         clean_addons = []
         for info in sorted(s["addon_map"].values(), key=lambda x: (x["ts"] or datetime.min)):
             clean_addons.append(info["name"])
         addons_text = "; ".join(clean_addons) if clean_addons else None
 
-        kind = "NORMAL"
-        if s["is_unlimited"]:
-            if s.get("session_index", 0) == 0:
-                kind = "SIGNUP"
-            else:
-                kind = "WASH"
+        # ----- Classification (tightened) -----
+        strong_signup = s.get("saw_unlimited_signature") or s.get("saw_creditcard_unlimited")
+        strong_wash   = s.get("saw_unlimited_pkg_name")
+
+        if strong_signup:
+            invoice_kind = "SIGNUP"
+            effective_is_unlimited = True
+            if not s.get("unlimited_type"):
+                s["unlimited_type"] = "NEW"
+        elif strong_wash:
+            invoice_kind = "WASH"
+            effective_is_unlimited = True
+        else:
+            invoice_kind = "NORMAL"
+            effective_is_unlimited = False
 
         rows.append({
             "bill": int(s["invoice"]),
             "wash_ts_first": s["first_ts"],
             "wash_ts_last": s["last_ts"],
-            "license_plate": s["license_plate"],
-            "customer_name": s["customer_name"],
+            "license_plate": s["license_plate"] or None,
+            "customer_name": s["customer_name"] or None,
             "wash_package_id": int(s["wash_package_id"]) if s["wash_package_id"] else None,
-            "wash_package_name": s["wash_package_name"],
+            "wash_package_name": s["wash_package_name"] or None,
             "wash_type": map_wash_type(s["wash_package_name"]),
-            "payment_type": s["payment_type"],
-            "image_path": s["image_path"],
-            "is_unlimited": s["is_unlimited"],
-            "unlimited_type": s["unlimited_type"],
+            "payment_type": s["payment_type"] or None,
+            "image_path": s["image_path"] or None,
+            "is_unlimited": effective_is_unlimited,
+            "unlimited_type": s["unlimited_type"] if effective_is_unlimited else None,
             "addons": addons_text,
             "tip_amount": float(s["tip_amount"] or 0.0),
-            "discount_code": s["discount_code"],
+            "discount_code": s["discount_code"] or None,
             "discount_amount": s["discount_amount"],
             "tax": s["tax"],
             "total": s["total"],
@@ -313,7 +367,7 @@ def parse_file(path: Path) -> List[Dict[str, Any]]:
             "source_file": path.name,
             "created_on": now_cst_date(),
             "created_at": now_cst_time(),
-            "invoice_kind": kind,
+            "invoice_kind": invoice_kind,
         })
     return rows
 
@@ -332,7 +386,7 @@ CREATE TABLE IF NOT EXISTS washify (
   payment_type       TEXT,
   image_path         TEXT,
   is_unlimited       BOOLEAN,
-  unlimited_type     TEXT CHECK (unlimited_type IN ('NEW','RECURRING') OR unlimited_type IS NULL),
+  unlimited_type     TEXT CHECK (unlimited_type IN ('NEW','RECURRING') OR washify.unlimited_type IS NULL),
   addons             TEXT,
   tip_amount         NUMERIC(8,2) DEFAULT 0.00,
   discount_code      TEXT,
@@ -442,6 +496,7 @@ def gather_input_files_local(input_path: str) -> List[Path]:
     raise FileNotFoundError(f"Input path not found: {input_path}")
 
 def main():
+    # determine inputs (local vs S3)
     from_s3 = False
     s3_key = None
     files: List[Path] = []
@@ -459,6 +514,7 @@ def main():
         files = [local_path]
         from_s3 = True
 
+    # parse + upsert
     all_rows: List[Dict[str, Any]] = []
     for f in files:
         all_rows.extend(parse_file(f))
@@ -480,6 +536,7 @@ def main():
     finally:
         conn.close()
 
+    # delete the S3 object only after successful DB write
     if from_s3 and s3_key:
         delete_s3_object(s3_key)
         print(f"🗑️ Deleted s3://{S3_BUCKET}/{s3_key}")
