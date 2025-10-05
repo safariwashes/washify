@@ -14,8 +14,8 @@ import psycopg2.extras
 import boto3
 from botocore.config import Config
 
-# timezone
-import pytz
+# timezone (Python 3.9+ built-in)
+from zoneinfo import ZoneInfo
 
 # Optional .env support
 try:
@@ -81,10 +81,10 @@ TOTAL_RE = re.compile(r"Total[:\s]+\$?([0-9]+(?:\.[0-9]{1,2})?)\b", re.IGNORECAS
 
 # ===================== HELPERS =====================
 def now_cst_date():
-    return datetime.now(pytz.timezone("US/Central")).date()
+    return datetime.now(ZoneInfo("America/Chicago")).date()
 
 def now_cst_time():
-    return datetime.now(pytz.timezone("US/Central")).time()
+    return datetime.now(ZoneInfo("America/Chicago")).time()
 
 def parse_ts(line: str) -> Tuple[Optional[datetime], str]:
     m = TS_RE.match(line)
@@ -403,85 +403,4 @@ def batch_upsert(conn, rows: List[Dict[str, Any]], batch_size: int = 500):
     total = 0
     with conn.cursor() as cur:
         for i in range(0, len(rows), batch_size):
-            chunk = rows[i:i+batch_size]
-            psycopg2.extras.execute_batch(cur, UPSERT_SQL, chunk, page_size=len(chunk))
-            total += len(chunk)
-    conn.commit()
-    return total
-
-# ===================== S3 HELPERS =====================
-s3 = boto3.client("s3", region_name=AWS_REGION, config=Config(signature_version="s3v4"))
-
-def latest_s3_object(prefix: str, file_match: str) -> Optional[dict]:
-    newest = None
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if file_match in os.path.basename(key):
-                if newest is None or obj["LastModified"] > newest["LastModified"]:
-                    newest = obj
-    return newest
-
-def download_s3_to_temp(key: str) -> Path:
-    basename = os.path.basename(key)
-    local_path = Path(tempfile.gettempdir()) / basename
-    s3.download_file(S3_BUCKET, key, str(local_path))
-    return local_path
-
-def delete_s3_object(key: str):
-    s3.delete_object(Bucket=S3_BUCKET, Key=key)
-
-# ===================== RUN =====================
-def gather_input_files_local(input_path: str) -> List[Path]:
-    p = Path(input_path)
-    if p.is_file():
-        return [p]
-    if p.is_dir():
-        return sorted(p.glob("*.txt"))
-    raise FileNotFoundError(f"Input path not found: {input_path}")
-
-def main():
-    from_s3 = False
-    s3_key = None
-    files: List[Path] = []
-
-    if INPUT_PATH:
-        files = gather_input_files_local(INPUT_PATH)
-    else:
-        obj = latest_s3_object(S3_PREFIX, FILE_MATCH)
-        if not obj:
-            print("No Transaction files in S3.")
-            return
-        s3_key = obj["Key"]
-        print(f"Downloading s3://{S3_BUCKET}/{s3_key} ...")
-        local_path = download_s3_to_temp(s3_key)
-        files = [local_path]
-        from_s3 = True
-
-    all_rows: List[Dict[str, Any]] = []
-    for f in files:
-        all_rows.extend(parse_file(f))
-
-    dedup: Dict[Tuple[int, str], Dict[str, Any]] = {}
-    for r in all_rows:
-        key = (r["bill"], r["source_file"])
-        dedup[key] = r
-    final_rows = list(dedup.values())
-
-    print(f"Parsed {len(all_rows)} raw rows → {len(final_rows)} after dedup")
-
-    conn = get_conn()
-    try:
-        create_table_if_needed(conn)
-        inserted = batch_upsert(conn, final_rows)
-        print(f"✅ Upserted {inserted} rows into washify")
-    finally:
-        conn.close()
-
-    if from_s3 and s3_key:
-        delete_s3_object(s3_key)
-        print(f"🗑️ Deleted s3://{S3_BUCKET}/{s3_key}")
-
-if __name__ == "__main__":
-    main()
+            chunk = rows[i:i+batch
