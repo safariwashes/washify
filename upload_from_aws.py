@@ -421,29 +421,7 @@ INSERT INTO washify (
   %(discount_code)s, %(discount_amount)s, %(tax)s, %(total)s,
   %(location)s, %(source_file)s, %(created_on)s, %(created_at)s, %(invoice_kind)s
 )
-ON CONFLICT (bill) DO UPDATE SET
-  wash_ts_first      = EXCLUDED.wash_ts_first,
-  wash_ts_last       = EXCLUDED.wash_ts_last,
-  license_plate      = EXCLUDED.license_plate,
-  customer_name      = EXCLUDED.customer_name,
-  wash_package_id    = EXCLUDED.wash_package_id,
-  wash_package_name  = EXCLUDED.wash_package_name,
-  wash_type          = EXCLUDED.wash_type,
-  payment_type       = EXCLUDED.payment_type,
-  image_path         = EXCLUDED.image_path,
-  is_unlimited       = EXCLUDED.is_unlimited,
-  unlimited_type     = EXCLUDED.unlimited_type,
-  addons             = EXCLUDED.addons,
-  tip_amount         = EXCLUDED.tip_amount,
-  discount_code      = EXCLUDED.discount_code,
-  discount_amount    = EXCLUDED.discount_amount,
-  tax                = EXCLUDED.tax,
-  total              = EXCLUDED.total,
-  location           = EXCLUDED.location,
-  source_file        = EXCLUDED.source_file,
-  created_on         = EXCLUDED.created_on,
-  created_at         = EXCLUDED.created_at,
-  invoice_kind       = EXCLUDED.invoice_kind;
+ON CONFLICT (bill) DO NOTHING;
 """
 
 def create_table_if_needed(conn):
