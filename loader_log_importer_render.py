@@ -2,13 +2,13 @@ import os
 import boto3
 import psycopg2
 import re
-import time
 from datetime import date
+import sys
 
 # ---------- Environment Variables ----------
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_PASSWORD = os.getenv("DB_PASSWORD") or os.getenv("DB_PASS")
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT", "5432")
 
@@ -45,6 +45,7 @@ def process_files():
     if "Contents" not in response:
         cursor.close()
         conn.close()
+        print("No loader files found in S3.")
         return
 
     for obj in response["Contents"]:
@@ -85,52 +86,36 @@ def process_files():
                     print(f"↻ Bill {bill} already exists, skipping insert but continuing updates")
 
                 # ---- Step #1: Update SUPER ----
-                try:
-                    cursor.execute("""
-                        UPDATE super
-                           SET status = 3,
-                               prep_end = %s,
-                               status_desc = 'Wash'
-                         WHERE bill = %s
-                           AND created_on = %s
-                           AND location = 'FRA'
-                           AND (status IS NULL OR status < 3)
-                    """, (time_part, bill, date_part))
-                    if cursor.rowcount > 0:
-                        print(f"🧾 SUPER updated for bill={bill}")
-                    conn.commit()
-                except Exception as e:
-                    print(f"⚠️ SUPER update failed for bill={bill}: {e}")
-                    conn.rollback()
+                cursor.execute("""
+                    UPDATE super
+                       SET status = 3,
+                           prep_end = %s,
+                           status_desc = 'Wash'
+                     WHERE bill = %s
+                       AND created_on = %s
+                       AND location = 'FRA'
+                       AND (status IS NULL OR status < 3)
+                """, (time_part, bill, date_part))
+                if cursor.rowcount > 0:
+                    print(f"🧾 SUPER updated for bill={bill}")
+                conn.commit()
 
                 # ---- Step #2: Update TUNNEL ----
-                try:
-                    cursor.execute("""
-                        UPDATE tunnel
-                           SET load = TRUE,
-                               load_time = %s
-                         WHERE bill = %s
-                           AND created_on = %s
-                           AND location = 'FRA'
-                    """, (time_part, bill, date_part))
-                    if cursor.rowcount > 0:
-                        print(f"🚗 TUNNEL updated for bill={bill}")
-                    conn.commit()
-                except Exception as e:
-                    print(f"⚠️ TUNNEL update failed for bill={bill}: {e}")
-                    conn.rollback()
+                cursor.execute("""
+                    UPDATE tunnel
+                       SET load = TRUE,
+                           load_time = %s
+                     WHERE bill = %s
+                       AND created_on = %s
+                       AND location = 'FRA'
+                """, (time_part, bill, date_part))
+                if cursor.rowcount > 0:
+                    print(f"🚗 TUNNEL updated for bill={bill}")
+                conn.commit()
 
             except Exception as e:
                 print(f"❌ Error parsing block {i}: {e}")
-
-        # ---- Move file to Archive ----
-        archive_key = f"loader1/Archive/{key.split('/')[-1]}"
-        try:
-            s3.copy_object(Bucket=S3_BUCKET, CopySource={"Bucket": S3_BUCKET, "Key": key}, Key=archive_key)
-            s3.delete_object(Bucket=S3_BUCKET, Key=key)
-            print(f"📦 Moved file to Archive: {archive_key}")
-        except Exception as e:
-            print(f"⚠️ Failed to move {key} to Archive: {e}")
+                conn.rollback()
 
         print(f"✅ File processed: {key}, {inserted_count} new records.\n")
 
@@ -148,12 +133,10 @@ def process_files():
     cursor.close()
     conn.close()
 
-# ---------- Continuous Monitor ----------
+# ---------- Entry Point ----------
 if __name__ == "__main__":
-    print("🚀 Loader2Safari Real-Time Monitor started...")
-    while True:
-        try:
-            process_files()
-        except Exception as e:
-            print(f"⚠️ Unexpected error: {e}")
-        time.sleep(5)  # check every 5 seconds
+    print("🚀 Loader2Safari single-run mode started...")
+    try:
+        process_files()
+    except Exception as e:
+        print(f"⚠️ Unexpected error: {e}")
