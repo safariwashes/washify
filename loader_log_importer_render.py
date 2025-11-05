@@ -2,7 +2,7 @@ import os
 import boto3
 import psycopg2
 import re
-from datetime import date
+from datetime import date, timedelta
 import sys
 
 # ---------- Environment Variables ----------
@@ -35,17 +35,12 @@ def connect_db():
     )
 
 # ---------- Process Function ----------
-def process_files():
-    conn = connect_db()
-    cursor = conn.cursor()
-    today_folder = date.today().strftime("%Y-%m-%d")
-    prefix = f"loader1/{today_folder}/"
-
+def process_folder(conn, cursor, folder):
+    prefix = f"loader1/{folder}/"
+    print(f"🔍 Checking folder: {prefix}")
     response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
     if "Contents" not in response:
-        cursor.close()
-        conn.close()
-        print("No loader files found in S3.")
+        print(f"No files in {prefix}")
         return
 
     for obj in response["Contents"]:
@@ -62,7 +57,6 @@ def process_files():
             try:
                 line1, line2, line4 = lines[i], lines[i + 1], lines[i + 3]
 
-                # Extract timestamp
                 ts_match = re.match(r"^([^,]+)", line1)
                 timestamp = ts_match.group(1).strip() if ts_match else ""
                 date_part, time_part = timestamp.split(" ", 1)
@@ -71,7 +65,6 @@ def process_files():
                 bill = int(re.search(r"Invoice Id (\d+)", line2).group(1))
                 washify_rec = int(re.search(r"Invoice Id (\d+)", line4).group(1))
 
-                # ---- Insert if new ----
                 cursor.execute("SELECT 1 FROM loader_log WHERE bill = %s", (bill,))
                 exists = cursor.fetchone()
                 if not exists:
@@ -118,6 +111,16 @@ def process_files():
                 conn.rollback()
 
         print(f"✅ File processed: {key}, {inserted_count} new records.\n")
+
+def process_files():
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    today_folder = date.today().strftime("%Y-%m-%d")
+    yesterday_folder = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    for folder in [today_folder, yesterday_folder]:
+        process_folder(conn, cursor, folder)
 
     # ---- Heartbeat ----
     try:
