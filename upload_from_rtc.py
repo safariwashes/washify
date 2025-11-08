@@ -1,7 +1,7 @@
 import os
 import sys
 import re
-import json
+import html
 import boto3
 import psycopg2
 from datetime import datetime
@@ -14,6 +14,7 @@ from botocore.exceptions import ClientError
 # - Downloads xmlInterfaceLog0.html from S3
 # - Parses wash IDs, washPkgNum, direction, timestamp
 # - Inserts into PostgreSQL table: rtc_log
+# - If parsing yields 0 entries, uploads to rtc/unparsed/ for review
 # ------------------------------------------------------------
 
 # ---------- CONFIG ----------
@@ -26,9 +27,9 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 
-# ---------- AWS + DB Clients ----------
 s3 = boto3.client("s3")
 
+# ---------- DB CONNECT ----------
 def get_db_connection():
     return psycopg2.connect(
         dbname=DB_NAME,
@@ -38,11 +39,7 @@ def get_db_connection():
         port=DB_PORT
     )
 
-# ---------- Parse HTML Log ----------
-import html
-
-import html
-
+# ---------- PARSER ----------
 def parse_rtc_log(content):
     """
     Parses Laguna XML log (xmlInterfaceLog0.html).
@@ -56,11 +53,10 @@ def parse_rtc_log(content):
     # Remove HTML tags
     content = re.sub(r"<[^>]+>", "", content)
 
-    # Split lines (some logs may have multiple <p> tags)
+    # Split into lines
     lines = [line.strip() for line in content.splitlines() if line.strip()]
 
     for line in lines:
-        # Example: Nov 06 2025 - 16:50:39 : 192.168.1.116 : send -> <tc><carAdded><id>26616781</id></carAdded></tc>
         m = re.match(
             r"(?P<ts>[A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-\s*(?P<hms>\d{2}:\d{2}:\d{2})\s*:\s*(?P<ip>[\d\.]+)\s*:\s*(?P<dir>send|recv).*?<id>(?P<wash_id>\d+)</id>.*?(?:<washPkgNum>(?P<washpkg>\d+)</washPkgNum>)?",
             line
@@ -76,7 +72,7 @@ def parse_rtc_log(content):
                 "wash_ts": wash_ts.strftime("%Y-%m-%d %H:%M:%S"),
                 "source_ip": m.group("ip"),
                 "direction": m.group("dir"),
-                "raw_xml": line[:500]  # store truncated original line
+                "raw_xml": line[:500]  # store truncated line
             })
         except Exception as e:
             print(f"⚠️ Parse error: {e}")
@@ -84,8 +80,7 @@ def parse_rtc_log(content):
 
     return entries
 
-
-# ---------- Download from S3 ----------
+# ---------- S3 DOWNLOAD ----------
 def download_from_s3(bucket, key):
     tmp_path = f"/tmp/{os.path.basename(key)}"
     try:
@@ -96,12 +91,20 @@ def download_from_s3(bucket, key):
         print(f"❌ S3 download failed: {e}")
         return None
 
+# ---------- RE-UPLOAD RAW FILE ----------
+def upload_unparsed_file(local_path, key):
+    try:
+        new_key = key.replace("rtc/", "rtc/unparsed/", 1)
+        s3.upload_file(local_path, S3_BUCKET, new_key)
+        print(f"⚠️ Uploaded unparsed file → s3://{S3_BUCKET}/{new_key}")
+    except Exception as e:
+        print(f"❌ Failed to upload unparsed file: {e}")
 
-# ---------- Insert into DB ----------
+# ---------- INSERT INTO DB ----------
 def insert_entries(entries):
     if not entries:
         print("⚠️ No valid entries parsed.")
-        return
+        return 0
 
     try:
         conn = get_db_connection()
@@ -132,10 +135,11 @@ def insert_entries(entries):
         cur.close()
         conn.close()
         print(f"✅ Inserted {len(entries)} RTC records into database.")
+        return len(entries)
 
     except Exception as e:
         print(f"❌ Database insert failed: {e}")
-
+        return 0
 
 # ---------- MAIN ----------
 def main():
@@ -145,27 +149,28 @@ def main():
 
     print(f"🚀 Processing RTC file: s3://{S3_BUCKET}/{S3_KEY}")
 
-    # Step 1: Download file
     local_path = download_from_s3(S3_BUCKET, S3_KEY)
     if not local_path:
         return
 
-    # Step 2: Parse content
     with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
+
     entries = parse_rtc_log(content)
     print(f"🧾 Parsed {len(entries)} RTC entries")
 
-    # Step 3: Insert into DB
-    insert_entries(entries)
+    inserted = insert_entries(entries)
 
-    # Step 4: Cleanup
+    # If parser failed → upload to /rtc/unparsed/
+    if inserted == 0:
+        upload_unparsed_file(local_path, S3_KEY)
+
+    # Cleanup
     try:
         os.remove(local_path)
         print(f"🧹 Cleaned up temp file {local_path}")
     except Exception:
         pass
-
 
 if __name__ == "__main__":
     main()
