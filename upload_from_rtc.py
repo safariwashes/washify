@@ -93,10 +93,17 @@ def download_from_s3(bucket, key):
 
 # ---------- RE-UPLOAD RAW FILE ----------
 def upload_unparsed_file(local_path, key):
+    """Re-uploads file only once to rtc/unparsed/, avoids recursion."""
     try:
+        # If file already resides under rtc/unparsed/, do nothing
+        if "rtc/unparsed/" in key:
+            print("⏭️ Skipping re-upload (already in unparsed/).")
+            return
+
         new_key = key.replace("rtc/", "rtc/unparsed/", 1)
         s3.upload_file(local_path, S3_BUCKET, new_key)
         print(f"⚠️ Uploaded unparsed file → s3://{S3_BUCKET}/{new_key}")
+
     except Exception as e:
         print(f"❌ Failed to upload unparsed file: {e}")
 
