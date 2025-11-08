@@ -39,17 +39,20 @@ def get_db_connection():
     )
 
 # ---------- Parse HTML Log ----------
+import html
+
 def parse_rtc_log(content):
     """
     Parse XML-like HTML lines from Laguna's xmlInterfaceLog0.html.
-    Extracts timestamp, IP, direction, wash_id, washPkgNum.
-    Returns list of dicts ready for DB insert.
+    Handles HTML tags and encoded entities.
     """
     entries = []
-    # Pattern example:
-    # Nov 06 2025 - 16:50:39 : 192.168.1.116 : send -> <tc><carAdded><id>26616781</id></carAdded></tc>
+    content = html.unescape(content)  # Decode &lt; and &gt;
+    # Remove any <p>, <code>, etc.
+    content = re.sub(r"<[^>]+>", "", content)
+
     pattern = re.compile(
-        r"(?P<ts>[A-Z][a-z]{2}\s+\d{2}\s+\d{4}\s*-\s*\d{2}:\d{2}:\d{2})\s*:\s*(?P<ip>[\d\.]+)\s*:\s*(?P<dir>send|recv).*?id&gt;(?P<wash_id>\d+)&lt;.*?(?:washPkgNum&gt;(?P<washpkg>\d+)&lt;)?",
+        r"(?P<ts>[A-Z][a-z]{2}\s+\d{2}\s+\d{4}\s*-\s*\d{2}:\d{2}:\d{2})\s*:\s*(?P<ip>[\d\.]+)\s*:\s*(?P<dir>send|recv)\s*->.*?<id>(?P<wash_id>\d+)</id>.*?(?:<washPkgNum>(?P<washpkg>\d+)</washPkgNum>)?",
         re.DOTALL
     )
 
@@ -66,7 +69,7 @@ def parse_rtc_log(content):
                 "wash_ts": wash_ts.strftime("%Y-%m-%d %H:%M:%S"),
                 "source_ip": match.group("ip"),
                 "direction": match.group("dir"),
-                "raw_xml": match.group(0)[:1000]  # keep short XML snippet
+                "raw_xml": match.group(0)[:1000]
             })
         except Exception as e:
             print(f"⚠️ Parse error: {e}")
