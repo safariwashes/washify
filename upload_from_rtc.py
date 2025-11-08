@@ -42,46 +42,60 @@ def get_db_connection():
 # ---------- PARSER ----------
 def parse_rtc_log(content):
     """
-    Parses Laguna xmlInterfaceLog0.html files.
-    Handles broken tags (< p>), HTML entities (&lt;), and mixed send/recv lines.
+    Robust parser for Laguna xmlInterfaceLog0.html
+    Handles encoding artifacts ( , non-ASCII dashes/colons) and HTML entity escaping.
     """
     import html, re
     from datetime import datetime
 
     # --- Normalize ---
-    content = content.replace(" ", "")                 # remove weird chars
-    content = html.unescape(content)                   # decode &lt; and &gt;
-    content = re.sub(r"<[^>]+>", "", content)          # strip remaining tags
-    lines = [l.strip() for l in content.splitlines() if l.strip()]
+    # fix mangled characters and entities
+    content = content.replace(" ", "")
+    content = html.unescape(content)
+    # replace en/em dashes, non-breaking spaces, smart quotes, etc.
+    content = re.sub(r"[\u2010-\u2015\u2212]", "-", content)
+    content = re.sub(r"[\u00A0\u2000-\u200B]", " ", content)
+    content = re.sub(r"[：]", ":", content)
+    # strip all residual HTML tags (<p>, <code>, etc.)
+    content = re.sub(r"<[^>]+>", "", content)
 
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
     entries = []
+
+    ts_pattern = re.compile(
+        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
+        re.IGNORECASE,
+    )
+
     for line in lines:
-        # Match: "Nov 07 2025 - 16:22:05 : 192.168.1.116 : recv -> <washSoft><addTail><id>26628320</id><washPkgNum>1</washPkgNum></addTail></washSoft>"
-        m = re.match(
-            r"(?P<ts>[A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-\s*(?P<hms>\d{2}:\d{2}:\d{2})\s*:\s*(?P<ip>[\d\.]+)\s*:\s*(?P<dir>send|recv)\s*->\s*(?P<body>.+)",
-            line
-        )
+        m = ts_pattern.match(line)
         if not m:
             continue
 
-        body = m.group("body")
-
-        # Capture wash ID and package number if present
+        body = m.group(5)
         wash_id = re.search(r"<id>(\d+)</id>", body)
         pkg = re.search(r"<washPkgNum>(\d+)</washPkgNum>", body)
 
         if wash_id:
-            entries.append({
-                "wash_id": wash_id.group(1),
-                "washpkgnum": int(pkg.group(1)) if pkg else None,
-                "wash_ts": datetime.strptime(
-                    f"{m.group('ts')} {m.group('hms')}", "%b %d %Y %H:%M:%S"
-                ).strftime("%Y-%m-%d %H:%M:%S"),
-                "source_ip": m.group("ip"),
-                "direction": m.group("dir"),
-                "raw_xml": body[:500]
-            })
+            try:
+                ts = datetime.strptime(
+                    f"{m.group(1)} {m.group(2)}", "%b %d %Y %H:%M:%S"
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts = None
 
+            entries.append(
+                {
+                    "wash_id": wash_id.group(1),
+                    "washpkgnum": int(pkg.group(1)) if pkg else None,
+                    "wash_ts": ts,
+                    "source_ip": m.group(3),
+                    "direction": m.group(4),
+                    "raw_xml": body[:500],
+                }
+            )
+
+    print(f"🔍 Debug: Matched {len(entries)} entries out of {len(lines)} lines")
     return entries
 
 # ---------- S3 DOWNLOAD ----------
