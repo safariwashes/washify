@@ -42,41 +42,45 @@ def get_db_connection():
 # ---------- PARSER ----------
 def parse_rtc_log(content):
     """
-    Parses Laguna XML log (xmlInterfaceLog0.html).
-    Handles HTML tags, encoded XML (&lt;&gt;), and mixed send/recv lines.
+    Parses Laguna xmlInterfaceLog0.html files.
+    Handles broken tags (< p>), HTML entities (&lt;), and mixed send/recv lines.
     """
+    import html, re
+    from datetime import datetime
+
+    # --- Normalize ---
+    content = content.replace(" ", "")                 # remove weird chars
+    content = html.unescape(content)                   # decode &lt; and &gt;
+    content = re.sub(r"<[^>]+>", "", content)          # strip remaining tags
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
+
     entries = []
-
-    # Decode entities like &lt; and &gt;
-    content = html.unescape(content)
-
-    # Remove HTML tags
-    content = re.sub(r"<[^>]+>", "", content)
-
-    # Split into lines
-    lines = [line.strip() for line in content.splitlines() if line.strip()]
-
     for line in lines:
+        # Match: "Nov 07 2025 - 16:22:05 : 192.168.1.116 : recv -> <washSoft><addTail><id>26628320</id><washPkgNum>1</washPkgNum></addTail></washSoft>"
         m = re.match(
-            r"(?P<ts>[A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-\s*(?P<hms>\d{2}:\d{2}:\d{2})\s*:\s*(?P<ip>[\d\.]+)\s*:\s*(?P<dir>send|recv).*?<id>(?P<wash_id>\d+)</id>.*?(?:<washPkgNum>(?P<washpkg>\d+)</washPkgNum>)?",
+            r"(?P<ts>[A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-\s*(?P<hms>\d{2}:\d{2}:\d{2})\s*:\s*(?P<ip>[\d\.]+)\s*:\s*(?P<dir>send|recv)\s*->\s*(?P<body>.+)",
             line
         )
         if not m:
             continue
 
-        try:
-            wash_ts = datetime.strptime(f"{m.group('ts')} {m.group('hms')}", "%b %d %Y %H:%M:%S")
+        body = m.group("body")
+
+        # Capture wash ID and package number if present
+        wash_id = re.search(r"<id>(\d+)</id>", body)
+        pkg = re.search(r"<washPkgNum>(\d+)</washPkgNum>", body)
+
+        if wash_id:
             entries.append({
-                "wash_id": m.group("wash_id"),
-                "washpkgnum": int(m.group("washpkg")) if m.group("washpkg") else None,
-                "wash_ts": wash_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                "wash_id": wash_id.group(1),
+                "washpkgnum": int(pkg.group(1)) if pkg else None,
+                "wash_ts": datetime.strptime(
+                    f"{m.group('ts')} {m.group('hms')}", "%b %d %Y %H:%M:%S"
+                ).strftime("%Y-%m-%d %H:%M:%S"),
                 "source_ip": m.group("ip"),
                 "direction": m.group("dir"),
-                "raw_xml": line[:500]  # store truncated line
+                "raw_xml": body[:500]
             })
-        except Exception as e:
-            print(f"⚠️ Parse error: {e}")
-            continue
 
     return entries
 
