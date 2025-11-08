@@ -60,6 +60,9 @@ def parse_rtc_log(content):
     content = re.sub(r"<[^>]+>", "", content)
 
     lines = [l.strip() for l in content.splitlines() if l.strip()]
+print("🧩 Sample lines after cleaning:")
+for l in lines[:5]:
+    print(l[:200])
     entries = []
 
     ts_pattern = re.compile(
