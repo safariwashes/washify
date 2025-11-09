@@ -47,20 +47,22 @@ def parse_rtc_log(content):
     import re, html
     from datetime import datetime
 
-    # --- Clean up broken tags but keep spacing ---
+    # --- Clean broken tags but keep spacing ---
     content = html.unescape(content)
     content = content.replace(" ", "")
     content = re.sub(r"<[^>]+>", " ", content)  # remove any <...> tags
 
-    # --- Ensure missing spaces in compact timestamps like 'Nov092025' ---
+    # --- Fix compact dates like Nov092025 (add missing spaces) ---
     content = re.sub(r"([A-Z][a-z]{2})(\d{2})(\d{4})", r"\1 \2 \3", content)
+    # --- Fix missing dash/space after year ---
+    content = re.sub(r"(\d{4})(-)(\d{2}:\d{2}:\d{2})", r"\1 - \3", content)
 
-    # --- Normalize dashes, colons, and whitespace ---
+    # --- Normalize dashes, colons, whitespace ---
     content = re.sub(r"[\u2010-\u2015\u2212]", "-", content)  # dash variants
     content = re.sub(r"[：]", ":", content)
     content = re.sub(r"\s+", " ", content).strip()
 
-    # --- Split into individual log lines ---
+    # --- Split into log lines ---
     lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{2}\s+\d{4}\s*-)", content)
     lines = [l.strip() for l in lines if l.strip()]
 
@@ -70,8 +72,9 @@ def parse_rtc_log(content):
 
     entries = []
 
+    # Accept "Nov 09 2025 - 13:48:02" or "Nov 09 2025-13:48:02"
     ts_pattern = re.compile(
-        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
+        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-?\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
         re.IGNORECASE,
     )
 
