@@ -39,39 +39,41 @@ def get_db_connection():
         port=DB_PORT
     )
 
-# ---------- PARSER ----------
 def parse_rtc_log(content):
     """
-    Robust parser for Laguna xmlInterfaceLog0.html
-    Handles encoding artifacts ( , non-ASCII dashes/colons) and HTML entity escaping.
+    Parser for Laguna xmlInterfaceLog0.html (RTC).
+    Cleans broken HTML tags and extracts (timestamp, IP, direction, XML).
     """
-    import html, re
+    import re, html
     from datetime import datetime
 
-    # --- Normalize ---
-    # fix mangled characters and entities
-    content = content.replace(" ", "")
+    # --- Clean up encoding artifacts ---
     content = html.unescape(content)
-    # replace en/em dashes, non-breaking spaces, smart quotes, etc.
-    content = re.sub(r"[\u2010-\u2015\u2212]", "-", content)
-    content = re.sub(r"[\u00A0\u2000-\u200B]", " ", content)
+    content = content.replace(" ", "")  # remove invalid chars
+    # remove broken tags like < p ...>, < code>, </ code>, etc.
+    content = re.sub(r"<[^>]+>", " ", content)
+    # normalize whitespace and separators
+    content = re.sub(r"[\u2010-\u2015\u2212]", "-", content)  # all dash types
     content = re.sub(r"[：]", ":", content)
-    # strip all residual HTML tags (<p>, <code>, etc.)
-    content = re.sub(r"<[^>]+>", "", content)
+    content = re.sub(r"\s+", " ", content).strip()
 
-    lines = [l.strip() for l in content.splitlines() if l.strip()]
-print("🧩 Sample lines after cleaning:")
-for l in lines[:5]:
-    print(l[:200])
+    # Split into pseudo-lines where each record starts with month name
+    lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{2}\s+\d{4})", content)
+    lines = [l.strip() for l in lines if l.strip()]
+
+    print("🧩 Sample lines after cleaning:")
+    for l in lines[:5]:
+        print(l[:180])
+
     entries = []
 
     ts_pattern = re.compile(
-        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
+        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*[-–—]\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
         re.IGNORECASE,
     )
 
     for line in lines:
-        m = ts_pattern.match(line)
+        m = ts_pattern.search(line)
         if not m:
             continue
 
