@@ -42,22 +42,21 @@ def get_db_connection():
 def parse_rtc_log(content):
     """
     Parser for Laguna xmlInterfaceLog0.html (RTC).
-    Cleans broken HTML tags and extracts (timestamp, IP, direction, XML).
+    Cleans broken HTML and extracts (timestamp, IP, direction, XML body).
     """
     import re, html
     from datetime import datetime
 
-    # --- Clean up encoding artifacts ---
+    # --- Clean up broken tags ---
     content = html.unescape(content)
-    content = content.replace(" ", "")  # remove invalid chars
-    # remove broken tags like < p ...>, < code>, </ code>, etc.
-    content = re.sub(r"<[^>]+>", " ", content)
-    # normalize whitespace and separators
-    content = re.sub(r"[\u2010-\u2015\u2212]", "-", content)  # all dash types
-    content = re.sub(r"[：]", ":", content)
+    content = content.replace(" ", "")
+    content = re.sub(r"<[^>]+>", " ", content)  # remove all <...> tags
     content = re.sub(r"\s+", " ", content).strip()
 
-    # Split into pseudo-lines where each record starts with month name
+    # --- Fix missing spaces between Month, Day, Year ---
+    content = re.sub(r"([A-Z][a-z]{2})(\d{2})(\d{4})", r"\1 \2 \3", content)
+
+    # Split into lines starting with month name
     lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{2}\s+\d{4})", content)
     lines = [l.strip() for l in lines if l.strip()]
 
@@ -68,7 +67,7 @@ def parse_rtc_log(content):
     entries = []
 
     ts_pattern = re.compile(
-        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*[-–—]\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
+        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*[-–—]?\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
         re.IGNORECASE,
     )
 
