@@ -47,43 +47,43 @@ def parse_rtc_log(content):
     import re, html
     from datetime import datetime
 
-    # --- Clean broken HTML but preserve structure ---
+    # --- Clean broken HTML but keep structure ---
     content = html.unescape(content)
     content = content.replace(" ", "")
-    content = re.sub(r"<[^>]+>", " ", content)  # remove all <...> tags
+    content = re.sub(r"<[^>]+>", " ", content)  # remove <...> tags
+    content = content.replace("\xa0", " ")  # remove non-breaking spaces
 
-    # --- Normalize all dashes first ---
-    # Replace any dash-like Unicode char with a simple "-"
+    # --- Normalize all dash variants to ASCII '-' ---
     content = re.sub(r"[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]", "-", content)
 
-    # --- Fix compact timestamps like 'Nov092025-13:09:01' ---
-    # 1. Add missing spaces between month/day/year
-    # 2. Add a dash-space before the time
+    # --- Force-fix compact timestamp pattern like 'Nov092025-13:09:01' ---
+    # This covers any junk between month/day/year/time.
     content = re.sub(
-        r"([A-Z][a-z]{2})(\d{2})(\d{4})[-]?\s*(\d{2}:\d{2}:\d{2})",
+        r"([A-Z][a-z]{2})\s*0?(\d{1,2})[^\dA-Za-z]+(\d{4})[^\dA-Za-z-]+(\d{2}:\d{2}:\d{2})",
         r"\1 \2 \3 - \4",
         content,
     )
-    # Handle leftover compact forms like Nov092025 (no time part)
-    content = re.sub(r"([A-Z][a-z]{2})(\d{2})(\d{4})", r"\1 \2 \3", content)
 
-    # --- Normalize colons and whitespace ---
+    # Handle simple compact 'Nov092025' (no time yet)
+    content = re.sub(r"([A-Z][a-z]{2})\s*0?(\d{1,2})[^\dA-Za-z]+(\d{4})", r"\1 \2 \3", content)
+
+    # --- Normalize punctuation and whitespace ---
     content = re.sub(r"[：]", ":", content)
     content = re.sub(r"\s+", " ", content).strip()
 
-    # --- Split into lines (each starting with month) ---
-    lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{2}\s+\d{4}\s*-)", content)
+    # --- Split into log-like lines ---
+    lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}\s*-)", content)
     lines = [l.strip() for l in lines if l.strip()]
 
     print("🧩 Sample lines after cleaning:")
     for l in lines[:5]:
-        print(l[:180])
+        print(l[:200])
 
     entries = []
 
-    # --- Match flexible timestamp patterns ---
+    # --- Match flexible RTC log format ---
     ts_pattern = re.compile(
-        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-?\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
+        r"([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})\s*-?\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
         re.IGNORECASE,
     )
 
