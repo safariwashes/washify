@@ -47,22 +47,31 @@ def parse_rtc_log(content):
     import re, html
     from datetime import datetime
 
-    # --- Clean broken tags but keep spacing ---
+    # --- Clean broken HTML but preserve structure ---
     content = html.unescape(content)
     content = content.replace(" ", "")
-    content = re.sub(r"<[^>]+>", " ", content)  # remove any <...> tags
+    content = re.sub(r"<[^>]+>", " ", content)  # remove all <...> tags
+
+    # --- Normalize all dashes first ---
+    # Replace any dash-like Unicode char with a simple "-"
+    content = re.sub(r"[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]", "-", content)
 
     # --- Fix compact timestamps like 'Nov092025-13:09:01' ---
-    # Add spaces between month/day/year, and a space before the time
-    content = re.sub(r"([A-Z][a-z]{2})(\d{2})(\d{4})(-)", r"\1 \2 \3 - ", content)
+    # 1. Add missing spaces between month/day/year
+    # 2. Add a dash-space before the time
+    content = re.sub(
+        r"([A-Z][a-z]{2})(\d{2})(\d{4})[-]?\s*(\d{2}:\d{2}:\d{2})",
+        r"\1 \2 \3 - \4",
+        content,
+    )
+    # Handle leftover compact forms like Nov092025 (no time part)
     content = re.sub(r"([A-Z][a-z]{2})(\d{2})(\d{4})", r"\1 \2 \3", content)
 
-    # --- Normalize punctuation and whitespace ---
-    content = re.sub(r"[\u2010-\u2015\u2212]", "-", content)  # normalize dashes
+    # --- Normalize colons and whitespace ---
     content = re.sub(r"[：]", ":", content)
     content = re.sub(r"\s+", " ", content).strip()
 
-    # --- Split into individual log entries ---
+    # --- Split into lines (each starting with month) ---
     lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{2}\s+\d{4}\s*-)", content)
     lines = [l.strip() for l in lines if l.strip()]
 
@@ -72,8 +81,9 @@ def parse_rtc_log(content):
 
     entries = []
 
+    # --- Match flexible timestamp patterns ---
     ts_pattern = re.compile(
-        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
+        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-?\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
         re.IGNORECASE,
     )
 
