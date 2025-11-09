@@ -52,17 +52,17 @@ def parse_rtc_log(content):
     content = content.replace(" ", "")
     content = re.sub(r"<[^>]+>", " ", content)  # remove any <...> tags
 
-    # --- Fix compact dates like Nov092025 (add missing spaces) ---
+    # --- Fix compact timestamps like 'Nov092025-13:09:01' ---
+    # Add spaces between month/day/year, and a space before the time
+    content = re.sub(r"([A-Z][a-z]{2})(\d{2})(\d{4})(-)", r"\1 \2 \3 - ", content)
     content = re.sub(r"([A-Z][a-z]{2})(\d{2})(\d{4})", r"\1 \2 \3", content)
-    # --- Fix missing dash/space after year ---
-    content = re.sub(r"(\d{4})(-)(\d{2}:\d{2}:\d{2})", r"\1 - \3", content)
 
-    # --- Normalize dashes, colons, whitespace ---
-    content = re.sub(r"[\u2010-\u2015\u2212]", "-", content)  # dash variants
+    # --- Normalize punctuation and whitespace ---
+    content = re.sub(r"[\u2010-\u2015\u2212]", "-", content)  # normalize dashes
     content = re.sub(r"[：]", ":", content)
     content = re.sub(r"\s+", " ", content).strip()
 
-    # --- Split into log lines ---
+    # --- Split into individual log entries ---
     lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{2}\s+\d{4}\s*-)", content)
     lines = [l.strip() for l in lines if l.strip()]
 
@@ -72,9 +72,8 @@ def parse_rtc_log(content):
 
     entries = []
 
-    # Accept "Nov 09 2025 - 13:48:02" or "Nov 09 2025-13:48:02"
     ts_pattern = re.compile(
-        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-?\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
+        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
         re.IGNORECASE,
     )
 
