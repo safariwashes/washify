@@ -47,17 +47,21 @@ def parse_rtc_log(content):
     import re, html
     from datetime import datetime
 
-    # --- Clean up broken tags ---
+    # --- Clean up broken tags but keep spacing ---
     content = html.unescape(content)
     content = content.replace(" ", "")
-    content = re.sub(r"<[^>]+>", " ", content)  # remove all <...> tags
-    content = re.sub(r"\s+", " ", content).strip()
+    content = re.sub(r"<[^>]+>", " ", content)  # remove any <...> tags
 
-    # --- Fix missing spaces between Month, Day, Year ---
+    # --- Ensure missing spaces in compact timestamps like 'Nov092025' ---
     content = re.sub(r"([A-Z][a-z]{2})(\d{2})(\d{4})", r"\1 \2 \3", content)
 
-    # Split into lines starting with month name
-    lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{2}\s+\d{4})", content)
+    # --- Normalize dashes, colons, and whitespace ---
+    content = re.sub(r"[\u2010-\u2015\u2212]", "-", content)  # dash variants
+    content = re.sub(r"[：]", ":", content)
+    content = re.sub(r"\s+", " ", content).strip()
+
+    # --- Split into individual log lines ---
+    lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{2}\s+\d{4}\s*-)", content)
     lines = [l.strip() for l in lines if l.strip()]
 
     print("🧩 Sample lines after cleaning:")
@@ -67,7 +71,7 @@ def parse_rtc_log(content):
     entries = []
 
     ts_pattern = re.compile(
-        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*[-–—]?\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
+        r"([A-Z][a-z]{2}\s+\d{2}\s+\d{4})\s*-\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
         re.IGNORECASE,
     )
 
@@ -101,7 +105,6 @@ def parse_rtc_log(content):
 
     print(f"🔍 Debug: Matched {len(entries)} entries out of {len(lines)} lines")
     return entries
-
 # ---------- S3 DOWNLOAD ----------
 def download_from_s3(bucket, key):
     tmp_path = f"/tmp/{os.path.basename(key)}"
