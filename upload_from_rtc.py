@@ -42,37 +42,32 @@ def get_db_connection():
 def parse_rtc_log(content):
     """
     Parser for Laguna xmlInterfaceLog0.html (RTC).
-    Cleans broken HTML and extracts (timestamp, IP, direction, XML body).
-    Handles both compact (Nov092025-13:09:01) and spaced (Nov 09 2025 - 13:09:01) formats.
+    Handles both compact and spaced timestamp formats,
+    including plain numeric lines (no XML tags).
+    Extracts wash_id, washPkgNum, timestamp, IP, direction.
     """
 
     import re
     from datetime import datetime
     import html as htmlmod
 
-    # --- Unescape HTML entities and normalize ---
-    content = htmlmod.unescape(content)   # turns &lt;tc&gt; → <tc>
+    # --- Unescape and normalize ---
+    content = htmlmod.unescape(content)
     content = content.replace(" ", "")
-    content = content.replace("\xa0", " ")  # non-breaking space → space
-
-    # --- Remove <p> / <code> etc. but keep spacing ---
+    content = content.replace("\xa0", " ")
     content = re.sub(r"<[^>]+>", " ", content)
-
-    # --- Normalize all dash-like characters to ASCII '-' ---
     content = re.sub(r"[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]", "-", content)
+    content = re.sub(r"[：]", ":", content)
+    content = re.sub(r"\s+", " ", content).strip()
 
-    # --- Repair compact timestamps like 'Nov092025-13:09:01' (no spaces) ---
+    # --- Repair compact timestamp like Nov092025-13:09:01 ---
     content = re.sub(
         r"([A-Z][a-z]{2})0?(\d{1,2})(\d{4})-?(\d{2}:\d{2}:\d{2})",
         r"\1 \2 \3 - \4",
         content,
     )
 
-    # --- Normalize punctuation and whitespace ---
-    content = re.sub(r"[：]", ":", content)
-    content = re.sub(r"\s+", " ", content).strip()
-
-    # --- Split into individual log lines ---
+    # --- Split into lines ---
     lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}\s*-)", content)
     lines = [l.strip() for l in lines if l.strip()]
 
@@ -82,64 +77,38 @@ def parse_rtc_log(content):
 
     entries = []
 
-    # --- Pattern for normal spaced timestamps ---
+    # --- Pattern for RTC entries (no XML tags) ---
+    # Example:
+    # Nov 9 2025 - 13:09:01:192.168.1.116:send-> 26645116
+    # Nov 9 2025 - 13:09:01:192.168.1.116:recv-> 26645116 3
     ts_pattern = re.compile(
-        r"([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})\s*-\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
+        r"([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})\s*-\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)->\s*(\d+)(?:\s+(\d+))?",
         re.IGNORECASE,
     )
 
     for line in lines:
         m = ts_pattern.search(line)
-
         if not m:
-            # Fallback for compact format like Nov092025-13:09:01:IP:send->
-            m2 = re.search(
-                r"([A-Z][a-z]{2})0?(\d{1,2})(\d{4})-(\d{2}:\d{2}:\d{2}):([\d\.]+):(send|recv)->(.*)",
-                line
-            )
-            if m2:
-                ts = f"{m2.group(1)} {m2.group(2)} {m2.group(3)} {m2.group(4)}"
-                body = m2.group(8)
-                wash_id = re.search(r"<id>(\d+)</id>", body)
-                pkg = re.search(r"<washPkgNum>(\d+)</washPkgNum>", body)
-                if wash_id:
-                    try:
-                        ts_fmt = datetime.strptime(ts, "%b %d %Y %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        ts_fmt = None
-                    entries.append({
-                        "wash_id": wash_id.group(1),
-                        "washpkgnum": int(pkg.group(1)) if pkg else None,
-                        "wash_ts": ts_fmt,
-                        "source_ip": m2.group(5),
-                        "direction": m2.group(6),
-                        "raw_xml": body[:500],
-                    })
             continue
 
-        # --- Standard match (spaced format) ---
-        body = m.group(5)
-        wash_id = re.search(r"<id>(\d+)</id>", body)
-        pkg = re.search(r"<washPkgNum>(\d+)</washPkgNum>", body)
+        try:
+            ts = datetime.strptime(
+                f"{m.group(1)} {m.group(2)}", "%b %d %Y %H:%M:%S"
+            ).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = None
 
-        if wash_id:
-            try:
-                ts = datetime.strptime(
-                    f"{m.group(1)} {m.group(2)}", "%b %d %Y %H:%M:%S"
-                ).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                ts = None
+        wash_id = m.group(5)
+        pkg_num = int(m.group(6)) if m.group(6) else None
 
-            entries.append(
-                {
-                    "wash_id": wash_id.group(1),
-                    "washpkgnum": int(pkg.group(1)) if pkg else None,
-                    "wash_ts": ts,
-                    "source_ip": m.group(3),
-                    "direction": m.group(4),
-                    "raw_xml": body[:500],
-                }
-            )
+        entries.append({
+            "wash_id": wash_id,
+            "washpkgnum": pkg_num,
+            "wash_ts": ts,
+            "source_ip": m.group(3),
+            "direction": m.group(4),
+            "raw_xml": line[:200]
+        })
 
     print(f"🔍 Debug: Matched {len(entries)} entries out of {len(lines)} lines")
     return entries
