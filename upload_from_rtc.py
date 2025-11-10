@@ -201,8 +201,15 @@ def main():
     if not local_path:
         return
 
-    with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
-        content = f.read()
+# --- Read file with auto-detected encoding (UTF-8 vs UTF-16) ---
+with open(local_path, "rb") as f:
+    raw = f.read()
+
+# Detect UTF-16 if there are lots of null bytes (0x00)
+if b"\x00" in raw[:200]:
+    content = raw.decode("utf-16", errors="ignore")
+else:
+    content = raw.decode("utf-8", errors="ignore")
 
     entries = parse_rtc_log(content)
     print(f"🧾 Parsed {len(entries)} RTC entries")
