@@ -76,6 +76,10 @@ def parse_rtc_log(content):
     lines = [l.strip() for l in lines if l.strip()]
 
     print("🧩 Sample lines after cleaning:")
+    print("🧪 Debug byte values for first line:")
+    if lines:
+     print([hex(ord(c)) for c in lines[0][:25]])
+
     for l in lines[:5]:
         print(l[:200])
 
