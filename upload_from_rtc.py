@@ -1,7 +1,7 @@
 import os
 import sys
 import re
-import html
+import html as htmlmod
 import boto3
 import psycopg2
 from datetime import datetime
@@ -44,50 +44,46 @@ def parse_rtc_log(content):
     Parser for Laguna xmlInterfaceLog0.html (RTC).
     Cleans broken HTML and extracts (timestamp, IP, direction, XML body).
     """
-    import re, html
+    import re
     from datetime import datetime
 
-    # --- Clean broken HTML but keep structure ---
-    content = html.unescape(content)
+    # --- Unescape HTML entities and strip odd replacement chars ---
+    content = htmlmod.unescape(content)   # turns &lt;tc&gt; into <tc>
     content = content.replace(" ", "")
-    content = re.sub(r"<[^>]+>", " ", content)  # remove <...> tags
-    content = content.replace("\xa0", " ")  # remove non-breaking spaces
+    content = content.replace("\xa0", " ")  # non-breaking space -> normal space
 
-    # --- Normalize all dash variants to ASCII '-' ---
+    # --- Remove any HTML tags but preserve spacing ---
+    content = re.sub(r"<[^>]+>", " ", content)
+
+    # --- Normalize all dash-like Unicode to ASCII '-' ---
     content = re.sub(r"[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]", "-", content)
 
-    # --- Force-fix compact timestamp pattern like 'Nov092025-13:09:01' ---
-    # This covers any junk between month/day/year/time.
+    # --- Repair compact timestamps like 'Nov092025-13:09:01' (or with junk between parts) ---
     content = re.sub(
-        r"([A-Z][a-z]{2})\s*0?(\d{1,2})[^\dA-Za-z]+(\d{4})[^\dA-Za-z-]+(\d{2}:\d{2}:\d{2})",
+        r"([A-Z][a-z]{2})\s*0?(\d{1,2})[^\w]+(\d{4})[^\w-]+(\d{2}:\d{2}:\d{2})",
         r"\1 \2 \3 - \4",
         content,
     )
-
-    # Handle simple compact 'Nov092025' (no time yet)
-    content = re.sub(r"([A-Z][a-z]{2})\s*0?(\d{1,2})[^\dA-Za-z]+(\d{4})", r"\1 \2 \3", content)
+    # Also handle compact 'Nov092025' without time
+    content = re.sub(r"([A-Z][a-z]{2})\s*0?(\d{1,2})[^\w]+(\d{4})", r"\1 \2 \3", content)
 
     # --- Normalize punctuation and whitespace ---
     content = re.sub(r"[：]", ":", content)
     content = re.sub(r"\s+", " ", content).strip()
 
-    # --- Split into log-like lines ---
+    # --- Split into log-like lines (each starting with a month token) ---
     lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}\s*-)", content)
     lines = [l.strip() for l in lines if l.strip()]
 
     print("🧩 Sample lines after cleaning:")
-    print("🧪 Debug byte values for first line:")
-    if lines:
-     print([hex(ord(c)) for c in lines[0][:25]])
-
     for l in lines[:5]:
         print(l[:200])
 
     entries = []
 
-    # --- Match flexible RTC log format ---
+    # Accept "Nov 09 2025 - 13:09:01" or "Nov 9 2025 - 13:09:01"
     ts_pattern = re.compile(
-        r"([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})\s*-?\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
+        r"([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})\s*-\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
         re.IGNORECASE,
     )
 
@@ -121,6 +117,7 @@ def parse_rtc_log(content):
 
     print(f"🔍 Debug: Matched {len(entries)} entries out of {len(lines)} lines")
     return entries
+
 # ---------- S3 DOWNLOAD ----------
 def download_from_s3(bucket, key):
     tmp_path = f"/tmp/{os.path.basename(key)}"
@@ -136,15 +133,12 @@ def download_from_s3(bucket, key):
 def upload_unparsed_file(local_path, key):
     """Re-uploads file only once to rtc/unparsed/, avoids recursion."""
     try:
-        # If file already resides under rtc/unparsed/, do nothing
         if "rtc/unparsed/" in key:
             print("⏭️ Skipping re-upload (already in unparsed/).")
             return
-
         new_key = key.replace("rtc/", "rtc/unparsed/", 1)
         s3.upload_file(local_path, S3_BUCKET, new_key)
         print(f"⚠️ Uploaded unparsed file → s3://{S3_BUCKET}/{new_key}")
-
     except Exception as e:
         print(f"❌ Failed to upload unparsed file: {e}")
 
@@ -153,11 +147,9 @@ def insert_entries(entries):
     if not entries:
         print("⚠️ No valid entries parsed.")
         return 0
-
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-
         insert_sql = """
             INSERT INTO rtc_log (
                 wash_id, washpkgnum, wash_ts,
@@ -165,7 +157,6 @@ def insert_entries(entries):
             )
             VALUES (%s, %s, %s, %s, %s, %s);
         """
-
         for e in entries:
             cur.execute(
                 insert_sql,
@@ -175,16 +166,14 @@ def insert_entries(entries):
                     e["wash_ts"],
                     e["source_ip"],
                     e["direction"],
-                    e["raw_xml"]
-                )
+                    e["raw_xml"],
+                ),
             )
-
         conn.commit()
         cur.close()
         conn.close()
         print(f"✅ Inserted {len(entries)} RTC records into database.")
         return len(entries)
-
     except Exception as e:
         print(f"❌ Database insert failed: {e}")
         return 0
@@ -201,26 +190,29 @@ def main():
     if not local_path:
         return
 
-# --- Read file with auto-detected encoding (UTF-8 vs UTF-16) ---
-with open(local_path, "rb") as f:
-    raw = f.read()
+    # --- Read file with auto-detected encoding (UTF-8 vs UTF-16) ---
+    if not os.path.exists(local_path):
+        print(f"❌ File not found after download: {local_path}")
+        return
 
-# Detect UTF-16 if there are lots of null bytes (0x00)
-if b"\x00" in raw[:200]:
-    content = raw.decode("utf-16", errors="ignore")
-else:
-    content = raw.decode("utf-8", errors="ignore")
+    with open(local_path, "rb") as f:
+        raw = f.read()
+
+    if b"\x00" in raw[:200]:
+        print("📜 Detected UTF-16 encoding")
+        content = raw.decode("utf-16", errors="ignore")
+    else:
+        print("📜 Detected UTF-8 encoding")
+        content = raw.decode("utf-8", errors="ignore")
 
     entries = parse_rtc_log(content)
     print(f"🧾 Parsed {len(entries)} RTC entries")
 
     inserted = insert_entries(entries)
 
-    # If parser failed → upload to /rtc/unparsed/
     if inserted == 0:
         upload_unparsed_file(local_path, S3_KEY)
 
-    # Cleanup
     try:
         os.remove(local_path)
         print(f"🧹 Cleaned up temp file {local_path}")
