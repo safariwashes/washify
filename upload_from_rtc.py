@@ -43,35 +43,36 @@ def parse_rtc_log(content):
     """
     Parser for Laguna xmlInterfaceLog0.html (RTC).
     Cleans broken HTML and extracts (timestamp, IP, direction, XML body).
+    Handles both compact (Nov092025-13:09:01) and spaced (Nov 09 2025 - 13:09:01) formats.
     """
+
     import re
     from datetime import datetime
+    import html as htmlmod
 
-    # --- Unescape HTML entities and strip odd replacement chars ---
-    content = htmlmod.unescape(content)   # turns &lt;tc&gt; into <tc>
+    # --- Unescape HTML entities and normalize ---
+    content = htmlmod.unescape(content)   # turns &lt;tc&gt; → <tc>
     content = content.replace(" ", "")
-    content = content.replace("\xa0", " ")  # non-breaking space -> normal space
+    content = content.replace("\xa0", " ")  # non-breaking space → space
 
-    # --- Remove any HTML tags but preserve spacing ---
+    # --- Remove <p> / <code> etc. but keep spacing ---
     content = re.sub(r"<[^>]+>", " ", content)
 
-    # --- Normalize all dash-like Unicode to ASCII '-' ---
+    # --- Normalize all dash-like characters to ASCII '-' ---
     content = re.sub(r"[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]", "-", content)
 
-    # --- Repair compact timestamps like 'Nov092025-13:09:01' (or with junk between parts) ---
+    # --- Repair compact timestamps like 'Nov092025-13:09:01' (no spaces) ---
     content = re.sub(
-        r"([A-Z][a-z]{2})\s*0?(\d{1,2})[^\w]+(\d{4})[^\w-]+(\d{2}:\d{2}:\d{2})",
+        r"([A-Z][a-z]{2})0?(\d{1,2})(\d{4})-?(\d{2}:\d{2}:\d{2})",
         r"\1 \2 \3 - \4",
         content,
     )
-    # Also handle compact 'Nov092025' without time
-    content = re.sub(r"([A-Z][a-z]{2})\s*0?(\d{1,2})[^\w]+(\d{4})", r"\1 \2 \3", content)
 
     # --- Normalize punctuation and whitespace ---
     content = re.sub(r"[：]", ":", content)
     content = re.sub(r"\s+", " ", content).strip()
 
-    # --- Split into log-like lines (each starting with a month token) ---
+    # --- Split into individual log lines ---
     lines = re.split(r"(?=[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}\s*-)", content)
     lines = [l.strip() for l in lines if l.strip()]
 
@@ -81,7 +82,7 @@ def parse_rtc_log(content):
 
     entries = []
 
-    # Accept "Nov 09 2025 - 13:09:01" or "Nov 9 2025 - 13:09:01"
+    # --- Pattern for normal spaced timestamps ---
     ts_pattern = re.compile(
         r"([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})\s*-\s*(\d{2}:\d{2}:\d{2})\s*:\s*([\d\.]+)\s*:\s*(send|recv)\s*->\s*(.*)",
         re.IGNORECASE,
@@ -89,9 +90,34 @@ def parse_rtc_log(content):
 
     for line in lines:
         m = ts_pattern.search(line)
+
         if not m:
+            # Fallback for compact format like Nov092025-13:09:01:IP:send->
+            m2 = re.search(
+                r"([A-Z][a-z]{2})0?(\d{1,2})(\d{4})-(\d{2}:\d{2}:\d{2}):([\d\.]+):(send|recv)->(.*)",
+                line
+            )
+            if m2:
+                ts = f"{m2.group(1)} {m2.group(2)} {m2.group(3)} {m2.group(4)}"
+                body = m2.group(8)
+                wash_id = re.search(r"<id>(\d+)</id>", body)
+                pkg = re.search(r"<washPkgNum>(\d+)</washPkgNum>", body)
+                if wash_id:
+                    try:
+                        ts_fmt = datetime.strptime(ts, "%b %d %Y %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        ts_fmt = None
+                    entries.append({
+                        "wash_id": wash_id.group(1),
+                        "washpkgnum": int(pkg.group(1)) if pkg else None,
+                        "wash_ts": ts_fmt,
+                        "source_ip": m2.group(5),
+                        "direction": m2.group(6),
+                        "raw_xml": body[:500],
+                    })
             continue
 
+        # --- Standard match (spaced format) ---
         body = m.group(5)
         wash_id = re.search(r"<id>(\d+)</id>", body)
         pkg = re.search(r"<washPkgNum>(\d+)</washPkgNum>", body)
