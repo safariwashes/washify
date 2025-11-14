@@ -2,7 +2,7 @@ import os
 import boto3
 import psycopg2
 import re
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 import sys
 
 # ---------- Environment Variables ----------
@@ -34,17 +34,19 @@ def connect_db():
         port=DB_PORT
     )
 
+
 # ============================================================
-#  NEW: Fetch last processed bill (for tail-start optimization)
+#  NEW: Fetch last processed bill (tail optimization)
 # ============================================================
 def get_last_processed_bill(cursor):
     cursor.execute("""
         SELECT bill, log_dt, log_time 
-          FROM loader_log
-      ORDER BY log_dt DESC, log_time DESC
-         LIMIT 1;
+        FROM loader_log
+        ORDER BY log_dt DESC, log_time DESC
+        LIMIT 1;
     """)
     result = cursor.fetchone()
+
     if result:
         bill, log_dt, log_time = result
         print(f"🧭 Last processed bill: {bill} at {log_dt} {log_time}")
@@ -55,18 +57,34 @@ def get_last_processed_bill(cursor):
 
 
 # ============================================================
-#  Process a folder (optimized)
+# Normalizes timestamps like:
+#   "3:27:19" → "03:27:19"
+#   "9:07:04" → "09:07:04"
+# ============================================================
+def normalize_time(t):
+    try:
+        return datetime.strptime(t, "%H:%M:%S").strftime("%H:%M:%S")
+    except:
+        # If missing leading zero
+        try:
+            return datetime.strptime(t, "%-H:%M:%S").strftime("%H:%M:%S")
+        except:
+            return None
+
+
+# ============================================================
+# Process a folder (optimized)
 # ============================================================
 def process_folder(conn, cursor, folder):
     prefix = f"loader1/{folder}/"
     print(f"🔍 Checking folder: {prefix}")
-    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
 
+    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
     if "Contents" not in response:
         print(f"No files in {prefix}")
         return
 
-    # --- Get last processed bill for tail-seek ---
+    # Get last processed bill
     last_bill = get_last_processed_bill(cursor)
 
     for obj in response["Contents"]:
@@ -76,59 +94,63 @@ def process_folder(conn, cursor, folder):
 
         print(f"📄 Detected file: {key}")
 
-        # Load file
-        body = s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8", errors="ignore")
+        # Read S3 file
+        body = s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode(
+            "utf-8", errors="ignore"
+        )
         lines = [line.strip() for line in body.splitlines() if line.strip()]
 
         # ===============================
-        #  TAIL-START: find last bill
+        #  Tail seek to last processed bill
         # ===============================
         start_index = 0
         if last_bill:
             last_pattern = f"Invoice Id {last_bill}"
-            for idx in range(len(lines) - 1, -1, -1):   # search backwards
+            for idx in range(len(lines) - 1, -1, -1):
                 if last_pattern in lines[idx]:
-                    start_index = idx - (idx % 4)  # align to block start
-                    print(f"⏩ Starting at block index {start_index} (after last bill {last_bill})")
+                    start_index = idx - (idx % 4)
+                    print(f"⏩ Starting at block {start_index}")
                     break
             else:
-                print("⚠️ Last bill not found in file, will process full file.")
+                print("⚠️ Last bill not found, processing full file.")
 
         inserted_count = 0
         i = start_index
+        full_success = True
 
         # ===============================
-        #  Process block-by-block
+        # Process blocks safely
         # ===============================
         while i < len(lines):
             try:
+                if i + 3 >= len(lines):
+                    print(f"⚠️ Incomplete block at index {i}, stopping.")
+                    break
+
                 line1 = lines[i]
-                line2 = lines[i + 1]
-                line4 = lines[i + 3]
+                line2 = lines[i+1]
+                line4 = lines[i+3]
 
-                # --------------------------------
-                # Extract timestamps
-                # --------------------------------
+                # Extract timestamp
                 ts_match = re.match(r"^([^,]+)", line1)
-                timestamp = ts_match.group(1).strip() if ts_match else ""
+                timestamp_raw = ts_match.group(1).strip() if ts_match else ""
 
-                # Safe split
-                parts = timestamp.split(" ", 1)
+                parts = timestamp_raw.split(" ", 1)
                 if len(parts) != 2:
-                    raise Exception(f"Bad timestamp: {timestamp}")
+                    raise Exception(f"Bad timestamp: {timestamp_raw}")
 
-                date_part, time_part = parts
-                time_part = time_part.replace("AM", "").replace("PM", "").strip()
+                date_part, time_raw = parts
+                time_raw = time_raw.replace("AM", "").replace("PM", "").strip()
+                time_part = normalize_time(time_raw)
 
-                # --------------------------------
+                if not time_part:
+                    raise Exception(f"Unparseable time: {time_raw}")
+
                 # Extract bill numbers
-                # --------------------------------
                 bill = int(re.search(r"Invoice Id (\d+)", line2).group(1))
                 washify_rec = int(re.search(r"Invoice Id (\d+)", line4).group(1))
 
-                # --------------------------------
-                # Check duplicate in loader_log
-                # --------------------------------
+                # Check existence in loader_log
                 cursor.execute("SELECT 1 FROM loader_log WHERE bill = %s", (bill,))
                 exists = cursor.fetchone()
 
@@ -143,9 +165,7 @@ def process_folder(conn, cursor, folder):
                 else:
                     print(f"↻ Bill {bill} already exists")
 
-                # --------------------------------
                 # Update SUPER
-                # --------------------------------
                 cursor.execute("""
                     UPDATE super
                        SET status = 3,
@@ -156,13 +176,9 @@ def process_folder(conn, cursor, folder):
                        AND location = 'FRA'
                        AND (status IS NULL OR status < 3)
                 """, (time_part, bill, date_part))
-                if cursor.rowcount > 0:
-                    print(f"🧾 SUPER updated for bill={bill}")
                 conn.commit()
 
-                # --------------------------------
                 # Update TUNNEL
-                # --------------------------------
                 cursor.execute("""
                     UPDATE tunnel
                        SET load = TRUE,
@@ -171,26 +187,28 @@ def process_folder(conn, cursor, folder):
                        AND created_on = %s
                        AND location = 'FRA'
                 """, (time_part, bill, date_part))
-                if cursor.rowcount > 0:
-                    print(f"🚗 TUNNEL updated for bill={bill}")
                 conn.commit()
 
             except Exception as e:
                 print(f"❌ Error parsing block {i}: {e}")
                 conn.rollback()
+                full_success = False
 
             i += 4
 
         print(f"✅ File processed: {key}, {inserted_count} new records.\n")
 
-        # --------------------------------
-        # Delete file after processing
-        # --------------------------------
-        try:
-            s3.delete_object(Bucket=S3_BUCKET, Key=key)
-            print(f"🧹 Deleted S3 file: {key}")
-        except Exception as e:
-            print(f"⚠️ Failed to delete file {key}: {e}")
+        # ===============================
+        # Delete file only if all good
+        # ===============================
+        if full_success:
+            try:
+                s3.delete_object(Bucket=S3_BUCKET, Key=key)
+                print(f"🧹 Deleted S3 file: {key}")
+            except Exception as e:
+                print(f"⚠️ Could not delete file: {e}")
+        else:
+            print("⚠️ File NOT deleted due to processing errors.")
 
 
 # ============================================================
@@ -200,10 +218,10 @@ def process_files():
     conn = connect_db()
     cursor = conn.cursor()
 
-    today_folder = date.today().strftime("%Y-%m-%d")
-    yesterday_folder = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    today = date.today().strftime("%Y-%m-%d")
+    yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    for folder in [today_folder, yesterday_folder]:
+    for folder in [today, yesterday]:
         process_folder(conn, cursor, folder)
 
     # Heartbeat
@@ -213,9 +231,9 @@ def process_files():
             VALUES (%s, CURRENT_DATE, CURRENT_TIME)
         """, ("Loader2Safari",))
         conn.commit()
-        print("💓 Heartbeat logged: Loader2Safari")
+        print("💓 Heartbeat logged.")
     except Exception as e:
-        print(f"⚠️ Heartbeat logging failed: {e}")
+        print(f"⚠️ Heartbeat failed: {e}")
 
     cursor.close()
     conn.close()
