@@ -34,39 +34,49 @@ def connect_db():
         port=DB_PORT
     )
 
-# ---------- Process Function ----------
+# ---------- Process Folder ----------
 def process_folder(conn, cursor, folder):
     prefix = f"loader1/{folder}/"
     print(f"🔍 Checking folder: {prefix}")
     response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+
     if "Contents" not in response:
         print(f"No files in {prefix}")
         return
 
     for obj in response["Contents"]:
         key = obj["Key"]
+
         if not key.lower().endswith(".txt"):
             continue
 
         print(f"📄 Detected file: {key}")
-        body = s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8", errors="ignore")
+
+        body = s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode(
+            "utf-8", errors="ignore"
+        )
         lines = [line.strip() for line in body.splitlines() if line.strip()]
         inserted_count = 0
 
+        # Process blocks of lines
         for i in range(0, len(lines), 4):
             try:
-                line1, line2, line4 = lines[i], lines[i + 1], lines[i + 3]
+                line1, line2, line4 = lines[i], lines[i+1], lines[i+3]
 
+                # Extract timestamp
                 ts_match = re.match(r"^([^,]+)", line1)
                 timestamp = ts_match.group(1).strip() if ts_match else ""
                 date_part, time_part = timestamp.split(" ", 1)
                 time_part = time_part.replace("AM", "").replace("PM", "").strip()
 
+                # Extract bill and washify_rec
                 bill = int(re.search(r"Invoice Id (\d+)", line2).group(1))
                 washify_rec = int(re.search(r"Invoice Id (\d+)", line4).group(1))
 
+                # Check existing loader_log entry
                 cursor.execute("SELECT 1 FROM loader_log WHERE bill = %s", (bill,))
                 exists = cursor.fetchone()
+
                 if not exists:
                     cursor.execute("""
                         INSERT INTO loader_log (bill, washify_rec, log_dt, log_time)
@@ -82,13 +92,14 @@ def process_folder(conn, cursor, folder):
                 cursor.execute("""
                     UPDATE super
                        SET status = 3,
-                           prep_end = %s,
+                           prep_end = CURRENT_DATE + (%s::time),
                            status_desc = 'Wash'
                      WHERE bill = %s
                        AND created_on = %s
                        AND location = 'FRA'
                        AND (status IS NULL OR status < 3)
                 """, (time_part, bill, date_part))
+
                 if cursor.rowcount > 0:
                     print(f"🧾 SUPER updated for bill={bill}")
                 conn.commit()
@@ -97,11 +108,12 @@ def process_folder(conn, cursor, folder):
                 cursor.execute("""
                     UPDATE tunnel
                        SET load = TRUE,
-                           load_time = %s
+                           load_time = CURRENT_DATE + (%s::time)
                      WHERE bill = %s
                        AND created_on = %s
                        AND location = 'FRA'
                 """, (time_part, bill, date_part))
+
                 if cursor.rowcount > 0:
                     print(f"🚗 TUNNEL updated for bill={bill}")
                 conn.commit()
@@ -110,8 +122,18 @@ def process_folder(conn, cursor, folder):
                 print(f"❌ Error parsing block {i}: {e}")
                 conn.rollback()
 
-        print(f"✅ File processed: {key}, {inserted_count} new records.\n")
+        print(f"✅ File processed: {key}, {inserted_count} new records.")
 
+        # ---------- DELETE FILE AFTER SUCCESS ----------
+        try:
+            s3.delete_object(Bucket=S3_BUCKET, Key=key)
+            print(f"🧹 Deleted S3 file: {key}")
+        except Exception as e:
+            print(f"⚠️ Failed to delete S3 file {key}: {e}")
+
+        print("")  # spacing
+
+# ---------- Master Process ----------
 def process_files():
     conn = connect_db()
     cursor = conn.cursor()
@@ -122,7 +144,7 @@ def process_files():
     for folder in [today_folder, yesterday_folder]:
         process_folder(conn, cursor, folder)
 
-    # ---- Heartbeat ----
+    # Heartbeat
     try:
         cursor.execute("""
             INSERT INTO heartbeat (source, created_on, created_at)
@@ -136,7 +158,7 @@ def process_files():
     cursor.close()
     conn.close()
 
-# ---------- Entry Point ----------
+# ---------- Entry ----------
 if __name__ == "__main__":
     print("🚀 Loader2Safari single-run mode started...")
     try:
