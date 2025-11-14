@@ -34,7 +34,29 @@ def connect_db():
         port=DB_PORT
     )
 
-# ---------- Process Folder ----------
+# ============================================================
+#  NEW: Fetch last processed bill (for tail-start optimization)
+# ============================================================
+def get_last_processed_bill(cursor):
+    cursor.execute("""
+        SELECT bill, log_dt, log_time 
+          FROM loader_log
+      ORDER BY log_dt DESC, log_time DESC
+         LIMIT 1;
+    """)
+    result = cursor.fetchone()
+    if result:
+        bill, log_dt, log_time = result
+        print(f"🧭 Last processed bill: {bill} at {log_dt} {log_time}")
+        return bill
+    else:
+        print("🧭 No previous bills, processing full file.")
+        return None
+
+
+# ============================================================
+#  Process a folder (optimized)
+# ============================================================
 def process_folder(conn, cursor, folder):
     prefix = f"loader1/{folder}/"
     print(f"🔍 Checking folder: {prefix}")
@@ -44,36 +66,69 @@ def process_folder(conn, cursor, folder):
         print(f"No files in {prefix}")
         return
 
+    # --- Get last processed bill for tail-seek ---
+    last_bill = get_last_processed_bill(cursor)
+
     for obj in response["Contents"]:
         key = obj["Key"]
-
         if not key.lower().endswith(".txt"):
             continue
 
         print(f"📄 Detected file: {key}")
 
-        body = s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode(
-            "utf-8", errors="ignore"
-        )
+        # Load file
+        body = s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8", errors="ignore")
         lines = [line.strip() for line in body.splitlines() if line.strip()]
+
+        # ===============================
+        #  TAIL-START: find last bill
+        # ===============================
+        start_index = 0
+        if last_bill:
+            last_pattern = f"Invoice Id {last_bill}"
+            for idx in range(len(lines) - 1, -1, -1):   # search backwards
+                if last_pattern in lines[idx]:
+                    start_index = idx - (idx % 4)  # align to block start
+                    print(f"⏩ Starting at block index {start_index} (after last bill {last_bill})")
+                    break
+            else:
+                print("⚠️ Last bill not found in file, will process full file.")
+
         inserted_count = 0
+        i = start_index
 
-        # Process blocks of lines
-        for i in range(0, len(lines), 4):
+        # ===============================
+        #  Process block-by-block
+        # ===============================
+        while i < len(lines):
             try:
-                line1, line2, line4 = lines[i], lines[i+1], lines[i+3]
+                line1 = lines[i]
+                line2 = lines[i + 1]
+                line4 = lines[i + 3]
 
-                # Extract timestamp
+                # --------------------------------
+                # Extract timestamps
+                # --------------------------------
                 ts_match = re.match(r"^([^,]+)", line1)
                 timestamp = ts_match.group(1).strip() if ts_match else ""
-                date_part, time_part = timestamp.split(" ", 1)
+
+                # Safe split
+                parts = timestamp.split(" ", 1)
+                if len(parts) != 2:
+                    raise Exception(f"Bad timestamp: {timestamp}")
+
+                date_part, time_part = parts
                 time_part = time_part.replace("AM", "").replace("PM", "").strip()
 
-                # Extract bill and washify_rec
+                # --------------------------------
+                # Extract bill numbers
+                # --------------------------------
                 bill = int(re.search(r"Invoice Id (\d+)", line2).group(1))
                 washify_rec = int(re.search(r"Invoice Id (\d+)", line4).group(1))
 
-                # Check existing loader_log entry
+                # --------------------------------
+                # Check duplicate in loader_log
+                # --------------------------------
                 cursor.execute("SELECT 1 FROM loader_log WHERE bill = %s", (bill,))
                 exists = cursor.fetchone()
 
@@ -84,36 +139,38 @@ def process_folder(conn, cursor, folder):
                     """, (bill, washify_rec, date_part, time_part))
                     conn.commit()
                     inserted_count += 1
-                    print(f"✅ Inserted bill={bill}")
+                    print(f"🆕 Inserted bill={bill}")
                 else:
-                    print(f"↻ Bill {bill} already exists, skipping insert but continuing updates")
+                    print(f"↻ Bill {bill} already exists")
 
-                # ---- Step #1: Update SUPER ----
+                # --------------------------------
+                # Update SUPER
+                # --------------------------------
                 cursor.execute("""
                     UPDATE super
                        SET status = 3,
-                           prep_end = CURRENT_DATE + (%s::time),
+                           prep_end = %s,
                            status_desc = 'Wash'
                      WHERE bill = %s
                        AND created_on = %s
                        AND location = 'FRA'
                        AND (status IS NULL OR status < 3)
                 """, (time_part, bill, date_part))
-
                 if cursor.rowcount > 0:
                     print(f"🧾 SUPER updated for bill={bill}")
                 conn.commit()
 
-                # ---- Step #2: Update TUNNEL ----
+                # --------------------------------
+                # Update TUNNEL
+                # --------------------------------
                 cursor.execute("""
                     UPDATE tunnel
                        SET load = TRUE,
-                           load_time = CURRENT_DATE + (%s::time)
+                           load_time = %s
                      WHERE bill = %s
                        AND created_on = %s
                        AND location = 'FRA'
                 """, (time_part, bill, date_part))
-
                 if cursor.rowcount > 0:
                     print(f"🚗 TUNNEL updated for bill={bill}")
                 conn.commit()
@@ -122,18 +179,23 @@ def process_folder(conn, cursor, folder):
                 print(f"❌ Error parsing block {i}: {e}")
                 conn.rollback()
 
-        print(f"✅ File processed: {key}, {inserted_count} new records.")
+            i += 4
 
-        # ---------- DELETE FILE AFTER SUCCESS ----------
+        print(f"✅ File processed: {key}, {inserted_count} new records.\n")
+
+        # --------------------------------
+        # Delete file after processing
+        # --------------------------------
         try:
             s3.delete_object(Bucket=S3_BUCKET, Key=key)
             print(f"🧹 Deleted S3 file: {key}")
         except Exception as e:
-            print(f"⚠️ Failed to delete S3 file {key}: {e}")
+            print(f"⚠️ Failed to delete file {key}: {e}")
 
-        print("")  # spacing
 
-# ---------- Master Process ----------
+# ============================================================
+#   Main runner
+# ============================================================
 def process_files():
     conn = connect_db()
     cursor = conn.cursor()
@@ -158,7 +220,7 @@ def process_files():
     cursor.close()
     conn.close()
 
-# ---------- Entry ----------
+
 if __name__ == "__main__":
     print("🚀 Loader2Safari single-run mode started...")
     try:
