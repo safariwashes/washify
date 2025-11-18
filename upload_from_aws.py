@@ -1,4 +1,4 @@
-# upload_from_aws.py  (FINAL REVISED VERSION)
+# upload_from_aws.py  (FINAL REVISED VERSION WITH FILENAME-BASED LOCATION/LANE)
 
 import os
 import re
@@ -27,7 +27,7 @@ except Exception:
 # ===================== CONFIG =====================
 AWS_REGION  = os.getenv("AWS_REGION", "us-east-2")
 S3_BUCKET   = os.getenv("S3_BUCKET", "safari-franklin-data")
-S3_PREFIX   = os.getenv("S3_PREFIX", "kiosks/")  # e.g. kiosks/, nash_kiosk1/, etc.
+S3_PREFIX   = os.getenv("S3_PREFIX", "kiosks/")  # e.g. kiosks/, etc.
 FILE_MATCH  = os.getenv("FILE_MATCH", "Transaction")
 
 # Local override for testing (file or directory)
@@ -120,31 +120,36 @@ def map_wash_type(name: Optional[str]) -> Optional[str]:
             return val
     return None
 
-# ===================== LOCATION / LANE DETECTION =====================
-def infer_site_and_lane_from_pathlike(pathlike: str) -> Tuple[Optional[str], Optional[int]]:
+# ===================== LOCATION / LANE DETECTION (FILENAME-BASED) =====================
+def infer_site_and_lane_from_filename(filename: str) -> Tuple[Optional[str], Optional[int]]:
     """
-    Infer site/location ('FRA' or 'NSH') and lane_no (1,2,...) from either:
-      - S3 key: 'kiosks/kiosk1/2025-11-16/....txt'
-      - Local path: '.../kiosks/kiosk1/...'
-      - Nashville keys: 'nash_kiosk1/...'
+    Determine site ('FRA' or 'NSH') and lane_no based on the filename itself.
 
-    Returns (site_code, lane_no) where site_code in {'FRA','NSH'} or None.
+    Franklin:
+      safariexpresswash_1004 Center Point Pl_1_TransactionMM-DD-YY.txt  → FRA, lane 1
+      safariexpresswash_1004 Center Point Pl_2_TransactionMM-DD-YY.txt  → FRA, lane 2
+
+    Nashville:
+      safariexpresswash_306 White Bridge Pike_1_TransactionMM-DD-YY.txt → NSH, lane 1
+      safariexpresswash_306 White Bridge Pike_2_TransactionMM-DD-YY.txt → NSH, lane 2
     """
-    s = pathlike.replace("\\", "/").lower()
+    fn = filename.lower()
 
-    # Franklin kiosks
-    if "/kiosks/kiosk1/" in s:
-        return "FRA", 1
-    if "/kiosks/kiosk2/" in s:
-        return "FRA", 2
+    site = None
+    if "1004 center point pl" in fn:
+        site = "FRA"
+    elif "306 white bridge pike" in fn:
+        site = "NSH"
 
-    # Nashville kiosks
-    if "nash_kiosk1/" in s:
-        return "NSH", 1
-    if "nash_kiosk2/" in s:
-        return "NSH", 2
+    lane_no = None
+    m = re.search(r"_(\d+)_transaction", fn)
+    if m:
+        try:
+            lane_no = int(m.group(1))
+        except Exception:
+            lane_no = None
 
-    return None, None
+    return site, lane_no
 
 # ===================== REVERSE SEARCH =====================
 def find_start_index_for_lines(lines: List[str], last_bill: Optional[int]) -> int:
@@ -574,9 +579,9 @@ def main():
         all_rows: List[Dict[str, Any]] = []
 
         for local_path, source_hint in file_entries:
-            # Determine site & lane from hint (S3 key or local path)
-            site_code, lane_no = infer_site_and_lane_from_pathlike(source_hint)
-            print(f"File: {source_hint} → site={site_code}, lane={lane_no}")
+            # Determine site & lane from the FILENAME (works for local + S3 temp)
+            site_code, lane_no = infer_site_and_lane_from_filename(local_path.name)
+            print(f"File: {local_path.name} → site={site_code}, lane={lane_no}")
 
             # Get last_bill for this site & today
             last_bill = get_last_bill_for_today_by_location(conn, site_code)
@@ -616,10 +621,6 @@ def main():
         final_rows = list(dedup.values())
         print(f"Parsed {len(all_rows)} rows → {len(final_rows)} after de-dup")
 
-        # Filter new bills per site (only if last_bill existed)
-        # NOTE: last_bill is per-file; since we already filtered start_idx using it,
-        # most duplicates are already avoided. We can optionally add a global filter here,
-        # but ON CONFLICT DO NOTHING also protects us at the DB level.
         inserted = batch_upsert(conn, final_rows)
         print(f"✅ Upserted {inserted} rows into washify")
 
