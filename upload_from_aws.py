@@ -182,13 +182,16 @@ def parse_file(
 ) -> List[Dict[str, Any]]:
     """
     Parse a single Transaction log file into washify rows.
-    site_code: 'FRA' or 'NSH' (location for DB).
-    lane_no: integer lane number (1,2,...).
-    start_index: line index to start parsing from (for reverse-search optimization).
-    """
 
-    sessions = []
-    sess = None
+    Key behaviors (important for SIGNUP flows):
+      - We DO NOT end a session on ResetTransaction (Washify can reset mid-flow and still continue the same signup).
+      - We accept Wash Package lines from ANY screen (PaymentScreenViewModel / ProceedToCarWashViewModel / etc.),
+        not only ServiceControlViewModel, because SIGNUP often logs the package there.
+      - If a later non-zero InvoiceID appears, we update to the latest invoice within the session.
+      - Tips are detected from "Wash Package ... Tip $X" and added to tip_amount (and not treated as wash type).
+    """
+    sessions: List[Dict[str, Any]] = []
+    sess: Optional[Dict[str, Any]] = None
 
     def new_session(ts: Optional[datetime]):
         return {
@@ -197,19 +200,25 @@ def parse_file(
             "last_ts": ts,
             "customer_name": None,
             "license_plate": None,
+
+            # main wash package (what becomes wash_type)
             "wash_package_id": None,
             "wash_package_name": None,
+
+            # payment / receipt / image
             "payment_type": None,
             "payment_type_ts": None,
             "image_path": None,
 
-            "is_unlimited": False,
+            # unlimited classification
             "unlimited_type": None,
             "unlimited_ts": None,
+            "saw_unlimited_signature": False,
+            "saw_creditcard_unlimited": False,
+            "saw_unlimited_pkg_name": False,
 
+            # add-ons / tips / discounts / totals
             "addon_map": {},  # pkg_id -> {name, ts}
-            "addons": [],
-
             "tip_amount": 0.0,
             "tip_ts": None,
 
@@ -217,11 +226,19 @@ def parse_file(
             "discount_amount": None,
             "tax": None,
             "total": None,
-
-            "saw_unlimited_signature": False,
-            "saw_creditcard_unlimited": False,
-            "saw_unlimited_pkg_name": False,
         }
+
+    def has_meaningful_data(s: Dict[str, Any]) -> bool:
+        return bool(
+            (s.get("invoice") and s["invoice"] != "0")
+            or s.get("wash_package_name")
+            or s.get("license_plate")
+            or s.get("customer_name")
+            or s.get("image_path")
+            or s.get("payment_type")
+            or s.get("saw_unlimited_signature")
+            or s.get("saw_creditcard_unlimited")
+        )
 
     def end_session(ts: Optional[datetime]):
         nonlocal sess
@@ -239,7 +256,6 @@ def parse_file(
         with path.open("r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
 
-    # Iterate lines from start_index
     for raw in lines[start_index:]:
         line = raw.strip()
         if not line:
@@ -256,13 +272,21 @@ def parse_file(
             if not sess["last_ts"] or ts > sess["last_ts"]:
                 sess["last_ts"] = ts
 
-        # ----- Invoice detection -----
+        # ----- Explicit new-transaction start marker -----
+        # "Adjust screen started" usually indicates a new customer flow on the kiosk.
+        if "AdjustScreenViewModel" in content and "Adjust screen started" in content:
+            if sess and has_meaningful_data(sess):
+                end_session(ts)
+            if sess is None:
+                sess = new_session(ts)
+
+        # ----- Invoice detection (keep the latest non-zero invoice) -----
         for regex in INVOICE_SEARCH_RES:
             m = regex.search(content)
-            if m and not sess["invoice"]:
+            if m:
                 inv = m.group(1)
-                if inv != "0":
-                    sess["invoice"] = inv
+                if inv and inv != "0":
+                    sess["invoice"] = inv  # always keep latest in-session invoice
 
         # ----- Unlimited markers -----
         if UNLIMITED_NEW_RE.search(content):
@@ -289,25 +313,43 @@ def parse_file(
         if m and not sess["license_plate"]:
             sess["license_plate"] = m.group(1).strip().upper()
 
-        # ----- Main Wash Package -----
-        if "ServiceControlViewModel" in content and "SelectServiceBlock" in content:
-            m = WASH_PKG_RE.search(content)
-            if m:
-                pkg_id = m.group(1).strip()
-                pkg_name = m.group(2).strip().rstrip(".")
-                sess["wash_package_id"] = pkg_id
-                sess["wash_package_name"] = pkg_name
-                if "UNLIMITED" in pkg_name.upper():
+        # ----- Wash package / Add-ons / Tip handling -----
+        m = WASH_PKG_RE.search(content)
+        if m:
+            pkg_id = m.group(1).strip()
+            pkg_name = m.group(2).strip().rstrip(".")
+            up = pkg_name.upper()
+
+            # Tip often shows up as "Wash Package <id> with Name Tip $10"
+            tip_m = TIP_AMOUNT_RE.search(pkg_name) or TIP_AMOUNT_RE.search(content)
+            is_tip = bool(tip_m) or up.startswith("TIP")
+            if is_tip:
+                try:
+                    amt = float(tip_m.group(1)) if tip_m else 0.0
+                    if amt > 0:
+                        sess["tip_amount"] = float(sess["tip_amount"] or 0) + amt
+                        sess["tip_ts"] = ts or sess["tip_ts"]
+                except Exception:
+                    pass
+            else:
+                # Main wash candidate if it maps to a wash type OR includes UNLIMITED
+                mapped = map_wash_type(pkg_name)
+                is_main_candidate = bool(mapped) or ("UNLIMITED" in up)
+
+                if "UNLIMITED" in up:
                     sess["saw_unlimited_pkg_name"] = True
 
-        # ----- Add-ons -----
-        if "SelectOptionalServiceBlock" in content:
-            m = WASH_PKG_RE.search(content)
-            if m:
-                add_pkg_id = m.group(1).strip()
-                add_name = m.group(2).strip().rstrip(".")
-                if add_name:
-                    sess["addon_map"][add_pkg_id] = {"name": add_name, "ts": ts}
+                if is_main_candidate:
+                    # Prefer a mapped wash over a non-mapped one
+                    current_mapped = map_wash_type(sess.get("wash_package_name"))
+                    if (sess["wash_package_name"] is None) or (current_mapped is None and mapped is not None):
+                        sess["wash_package_id"] = pkg_id
+                        sess["wash_package_name"] = pkg_name
+                else:
+                    # Optional services become add-ons (but avoid duplicating the main package)
+                    if "SelectOptionalServiceBlock" in content:
+                        if pkg_id and pkg_id != str(sess.get("wash_package_id") or ""):
+                            sess["addon_map"][pkg_id] = {"name": pkg_name, "ts": ts}
 
         # ----- Payment Type -----
         if "SaveTransactions" in content and "SaveTransaction" in content:
@@ -355,27 +397,31 @@ def parse_file(
             except Exception:
                 pass
 
-        # ----- End-of-transaction markers -----
-        if ("ProceedToCarWashViewModel" in content and "ReturnToMainScreen" in content) or \
-           ("TransactionMethods" in content and "ResetTransaction" in content):
+        # ----- End-of-transaction marker -----
+        # Only end on "ReturnToMainScreen" (ResetTransaction happens mid-flow, especially for SIGNUP).
+        if "ProceedToCarWashViewModel" in content and "ReturnToMainScreen" in content:
             end_session(ts)
+
+    # flush trailing
+    if sess and has_meaningful_data(sess):
+        sessions.append(sess)
 
     # ----- Convert sessions → DB rows -----
     rows: List[Dict[str, Any]] = []
     for s in sessions:
-        if not s["invoice"] or s["invoice"] == "0":
+        if not s.get("invoice") or s["invoice"] == "0":
             continue
 
         # Add-ons in time order
         sorted_addons = sorted(
             s["addon_map"].values(),
-            key=lambda x: (x["ts"] or datetime.min)
+            key=lambda x: (x["ts"] or datetime.min),
         )
         addons_text = "; ".join([a["name"] for a in sorted_addons]) if sorted_addons else None
 
         # Unlimited classification
-        strong_signup = s["saw_unlimited_signature"] or s["saw_creditcard_unlimited"]
-        strong_wash   = s["saw_unlimited_pkg_name"]
+        strong_signup = bool(s["saw_unlimited_signature"] or s["saw_creditcard_unlimited"])
+        strong_wash = bool(s["saw_unlimited_pkg_name"])
 
         if strong_signup:
             invoice_kind = "SIGNUP"
@@ -389,32 +435,34 @@ def parse_file(
             invoice_kind = "NORMAL"
             is_unl = False
 
-        rows.append({
-            "bill": int(s["invoice"]),
-            "wash_ts_first": s["first_ts"],
-            "wash_ts_last": s["last_ts"],
-            "license_plate": s["license_plate"],
-            "customer_name": s["customer_name"],
-            "wash_package_id": int(s["wash_package_id"]) if s["wash_package_id"] else None,
-            "wash_package_name": s["wash_package_name"],
-            "wash_type": map_wash_type(s["wash_package_name"]),
-            "payment_type": s["payment_type"],
-            "image_path": s["image_path"],
-            "is_unlimited": is_unl,
-            "unlimited_type": s["unlimited_type"] if is_unl else None,
-            "addons": addons_text,
-            "tip_amount": float(s["tip_amount"] or 0),
-            "discount_code": s["discount_code"],
-            "discount_amount": s["discount_amount"],
-            "tax": s["tax"],
-            "total": s["total"],
-            "location": site_code,        # 'FRA' or 'NSH'
-            "lane_no": lane_no,           # 1, 2, ...
-            "source_file": path.name,
-            "created_on": now_cst_date(),
-            "created_at": now_cst_time(),
-            "invoice_kind": invoice_kind,
-        })
+        rows.append(
+            {
+                "bill": int(s["invoice"]),
+                "wash_ts_first": s["first_ts"],
+                "wash_ts_last": s["last_ts"],
+                "license_plate": s["license_plate"],
+                "customer_name": s["customer_name"],
+                "wash_package_id": int(s["wash_package_id"]) if s["wash_package_id"] else None,
+                "wash_package_name": s["wash_package_name"],
+                "wash_type": map_wash_type(s["wash_package_name"]),
+                "payment_type": s["payment_type"],
+                "image_path": s["image_path"],
+                "is_unlimited": is_unl,
+                "unlimited_type": s["unlimited_type"] if is_unl else None,
+                "addons": addons_text,
+                "tip_amount": float(s["tip_amount"] or 0),
+                "discount_code": s["discount_code"],
+                "discount_amount": s["discount_amount"],
+                "tax": s["tax"],
+                "total": s["total"],
+                "location": site_code,
+                "lane_no": lane_no,
+                "source_file": path.name,
+                "created_on": now_cst_date(),
+                "created_at": now_cst_time(),
+                "invoice_kind": invoice_kind,
+            }
+        )
 
     return rows
 
@@ -468,8 +516,41 @@ INSERT INTO washify (
   %(discount_code)s, %(discount_amount)s, %(tax)s, %(total)s,
   %(location)s, %(lane_no)s, %(source_file)s, %(created_on)s, %(created_at)s, %(invoice_kind)s
 )
-ON CONFLICT (bill) DO NOTHING;
+ON CONFLICT (bill) DO UPDATE SET
+  -- Keep earliest/first and latest/last timestamps sensible
+  wash_ts_first = COALESCE(washify.wash_ts_first, EXCLUDED.wash_ts_first),
+  wash_ts_last  = GREATEST(COALESCE(washify.wash_ts_last, EXCLUDED.wash_ts_last), EXCLUDED.wash_ts_last),
+
+  -- Fill missing metadata (don't overwrite existing non-null values)
+  license_plate     = COALESCE(washify.license_plate, EXCLUDED.license_plate),
+  customer_name     = COALESCE(washify.customer_name, EXCLUDED.customer_name),
+  wash_package_id   = COALESCE(washify.wash_package_id, EXCLUDED.wash_package_id),
+  wash_package_name = COALESCE(washify.wash_package_name, EXCLUDED.wash_package_name),
+  wash_type         = COALESCE(washify.wash_type, EXCLUDED.wash_type),
+  payment_type      = COALESCE(washify.payment_type, EXCLUDED.payment_type),
+  image_path        = COALESCE(washify.image_path, EXCLUDED.image_path),
+  is_unlimited      = COALESCE(washify.is_unlimited, EXCLUDED.is_unlimited),
+  unlimited_type    = COALESCE(washify.unlimited_type, EXCLUDED.unlimited_type),
+  addons            = COALESCE(washify.addons, EXCLUDED.addons),
+
+  -- Update tip if we previously had 0/NULL and new parse has a positive value
+  tip_amount        = CASE
+                        WHEN (washify.tip_amount IS NULL OR washify.tip_amount = 0) AND EXCLUDED.tip_amount > 0
+                          THEN EXCLUDED.tip_amount
+                        ELSE washify.tip_amount
+                      END,
+
+  discount_code     = COALESCE(washify.discount_code, EXCLUDED.discount_code),
+  discount_amount   = COALESCE(washify.discount_amount, EXCLUDED.discount_amount),
+  tax               = COALESCE(washify.tax, EXCLUDED.tax),
+  total             = COALESCE(washify.total, EXCLUDED.total),
+
+  location          = COALESCE(washify.location, EXCLUDED.location),
+  lane_no           = COALESCE(washify.lane_no, EXCLUDED.lane_no),
+  source_file       = COALESCE(washify.source_file, EXCLUDED.source_file),
+  invoice_kind      = COALESCE(washify.invoice_kind, EXCLUDED.invoice_kind);
 """
+
 
 def create_table_if_needed(conn):
     with conn.cursor() as cur:
