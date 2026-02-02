@@ -117,6 +117,24 @@ def get_conn():
         sslmode=os.getenv("DB_SSLMODE", "require"),
     )
 
+def db_fingerprint(conn) -> str:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_database(), current_user, inet_server_addr()::text, inet_server_port()::text")
+            db, user, addr, port = cur.fetchone()
+            return f"db={db} user={user} host={addr}:{port}"
+    except Exception as e:
+        return f"(db fingerprint failed: {e})"
+
+def location_exists(conn, location_id: str) -> bool:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM locations WHERE location_id = %s LIMIT 1", (location_id,))
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
 
 def ensure_rule_tables(conn) -> None:
     """
@@ -1120,6 +1138,7 @@ def main():
         return
 
     conn = get_conn()
+        print('DB:', db_fingerprint(conn))
     print(f"WORKER_MODE={WORKER_MODE} TENANT_FILTER={'ALL' if not TENANT_FILTER else ','.join(sorted(TENANT_FILTER))}")
     try:
         tenant_id_single = resolve_tenant_id(conn) if WORKER_MODE == "single" else None
@@ -1300,6 +1319,13 @@ def main():
 
         print(f"Parsed {len(all_rows)} rows → {len(final_rows)} after de-dup (by bill)")
 
+        # Validate FK targets (locations) to avoid hard crash and to expose DB mismatch
+        bad_locs = sorted({r.get("location_id") for r in final_rows if r.get("location_id") and not location_exists(conn, r.get("location_id"))})
+        if bad_locs:
+            print("ERROR: Some location_id values are missing in locations table on this DB. Skipping those rows.")
+            print("Missing location_id(s):", ", ".join(bad_locs[:20]) + ("..." if len(bad_locs) > 20 else ""))
+            final_rows = [r for r in final_rows if r.get("location_id") and location_exists(conn, r.get("location_id"))]
+            print(f"Remaining rows after FK filter: {len(final_rows)}")
         inserted = batch_upsert(conn, final_rows)
         print(f"✅ Upserted {inserted} rows into pos")
 
