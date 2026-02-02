@@ -1138,7 +1138,7 @@ def main():
         return
 
     conn = get_conn()
-        print('DB:', db_fingerprint(conn))
+    print('DB:', db_fingerprint(conn))
     print(f"WORKER_MODE={WORKER_MODE} TENANT_FILTER={'ALL' if not TENANT_FILTER else ','.join(sorted(TENANT_FILTER))}")
     try:
         tenant_id_single = resolve_tenant_id(conn) if WORKER_MODE == "single" else None
