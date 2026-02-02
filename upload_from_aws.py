@@ -60,6 +60,11 @@ S3_BUCKET   = (os.getenv("S3_BUCKET") or "").strip()
 S3_PREFIX   = (os.getenv("S3_PREFIX") or "kiosks/").strip()
 FILE_MATCH  = (os.getenv("FILE_MATCH") or "Transaction").strip()
 
+# ===================== ARCHIVE SETTINGS =====================
+ARCHIVE_ENABLED = str(os.getenv("ARCHIVE_ENABLED", "1")).strip() not in {"0","false","False","no","NO"}
+ARCHIVE_PREFIX  = os.getenv("ARCHIVE_PREFIX", "kiosks_archive/").strip()
+ARCHIVE_LATEST_NAME = os.getenv("ARCHIVE_LATEST_NAME", "latest.txt").strip()
+
 # Local override for testing (file or directory)
 INPUT_PATH = os.getenv("INPUT_PATH")
 
@@ -93,6 +98,33 @@ TENANT_SLUG   = (os.getenv("TENANT_SLUG") or "").strip().lower()
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
 
+
+# ===================== IMAGE PATH NORMALIZATION =====================
+IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "https://drbwashifyimages.s3.amazonaws.com/").rstrip("/")
+
+def normalize_image_path(raw: Optional[str], bill: Optional[int] = None) -> Optional[str]:
+    """Convert kiosk 'Aws File Name ...' value to a full URL.
+
+    Example raw: 'Server_10/103/171/IpCameraImages/27502577'
+    Output: 'https://drbwashifyimages.s3.amazonaws.com/Server_10/103/171/IpCameraImages/27502577_Full.jpg'
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.lower().startswith(("http://", "https://")):
+        return s
+
+    # Keep only the path part if the log includes a prefix like "Aws File Name".
+    s = re.sub(r"^Aws File Name\s+", "", s, flags=re.IGNORECASE).strip()
+
+    if "Server_10/" in s and "/IpCameraImages/" in s:
+        if not s.endswith("_Full.jpg"):
+            s = f"{s}_Full.jpg"
+        return f"{IMAGE_BASE_URL}/{s}"
+    return s
+
 # ===================== TIME HELPERS =====================
 def now_cst() -> datetime:
     return datetime.now(ZoneInfo("America/Chicago"))
@@ -116,24 +148,6 @@ def get_conn():
         port=os.getenv("DB_PORT", "5432"),
         sslmode=os.getenv("DB_SSLMODE", "require"),
     )
-
-def db_fingerprint(conn) -> str:
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT current_database(), current_user, inet_server_addr()::text, inet_server_port()::text")
-            db, user, addr, port = cur.fetchone()
-            return f"db={db} user={user} host={addr}:{port}"
-    except Exception as e:
-        return f"(db fingerprint failed: {e})"
-
-def location_exists(conn, location_id: str) -> bool:
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM locations WHERE location_id = %s LIMIT 1", (location_id,))
-            return cur.fetchone() is not None
-    except Exception:
-        return False
-
 
 
 def ensure_rule_tables(conn) -> None:
@@ -299,7 +313,38 @@ def load_wash_type_rules(conn, tenant_id: str) -> List[Dict[str, Any]]:
                 r["_re"] = re.compile(r["pattern"], re.IGNORECASE)
             except Exception:
                 r["_re"] = None
+    if not rules:
+        ensure_default_wash_type_rules(conn, tenant_id)
+        return load_wash_type_rules(conn, tenant_id)
     return rules
+
+
+
+def ensure_default_wash_type_rules(conn, tenant_id: str):
+    """Seed basic wash type rules if none exist for this tenant."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM wash_type_rules WHERE tenant_id = %s", (tenant_id,))
+        cnt = int(cur.fetchone()[0] or 0)
+        if cnt > 0:
+            return
+        defaults = [
+            ("exact", "BASIC WASH", "Basic", 10),
+            ("exact", "GOOD WASH", "Good", 20),
+            ("exact", "BETTER WASH", "Better", 30),
+            ("exact", "BEST WASH", "Best", 40),
+            ("exact", "INTERIOR SUP.", "Super", 50),
+            ("exact", "INTERIOR SUP", "Super", 51),
+            ("contains", "INTERIOR", "Super", 60),
+        ]
+        cur.executemany(
+            """
+            INSERT INTO wash_type_rules (tenant_id, match_type, pattern, wash_type, priority, enabled)
+            VALUES (%s,%s,%s,%s,%s,TRUE)
+            ON CONFLICT DO NOTHING
+            """,
+            [(tenant_id, mt, pat, wt, pr) for (mt, pat, wt, pr) in defaults],
+        )
+    conn.commit()
 
 def load_ingest_offset(conn, tenant_id: str, location_id: str, lane_no: int, source_file: str) -> Optional[Dict[str, Any]]:
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -454,8 +499,18 @@ def find_last_bill_index(lines: List[str], last_bill: Optional[int]) -> Optional
 
 
 # ===================== WASH TYPE RESOLUTION (DB RULES) =====================
-def normalize_ws_name(s: str) -> str:
-    return re.sub(r"\s{2,}", " ", (s or "").strip())
+def normalize_ws_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    s = str(name).strip()
+    if not s:
+        return None
+    # Kiosk sometimes logs: 'Customer Name  PD50230 VehicleID... ServiceID...'
+    for stop in ["VehicleID", "ServiceID", "ServiceName", "VehicleId", "ServiceId"]:
+        if stop in s:
+            s = s.split(stop, 1)[0].strip()
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s or None
 
 
 def map_wash_type_from_rules(pkg_name: Optional[str], rules: List[Dict[str, Any]]) -> Optional[str]:
@@ -753,7 +808,7 @@ def parse_file(
                 "wash_package_name": s["wash_package_name"],
                 "wash_type": map_wash_type_from_rules(s["wash_package_name"], wash_type_rules),
                 "payment_type": s["payment_type"],
-                "image_path": s["image_path"],
+                "image_path": normalize_image_path(s.get("image_path"), int(s["invoice"])),
                 "is_unlimited": is_unl,
                 "unlimited_type": s["unlimited_type"] if is_unl else None,
                 "addons": addons_text,
@@ -999,6 +1054,22 @@ def delete_s3_object(key: str):
     s3 = get_s3_client()
     s3.delete_object(Bucket=S3_BUCKET, Key=key)
 
+def archive_and_delete_s3_object(key: str, tenant_value: Optional[str]=None, address_value: Optional[str]=None, lane_no: Optional[int]=None):
+    """Archive processed file to S3 (overwrite latest), then delete original."""
+    if not ARCHIVE_ENABLED:
+        return
+    s3 = get_s3_client()
+
+    mirror_key = f"{ARCHIVE_PREFIX.rstrip('/')}/{key.lstrip('/')}"
+    s3.copy_object(Bucket=S3_BUCKET, CopySource={"Bucket": S3_BUCKET, "Key": key}, Key=mirror_key)
+
+    if tenant_value and address_value and lane_no is not None:
+        latest_key = f"{ARCHIVE_PREFIX.rstrip('/')}/tenant={tenant_value}/address={address_value}/lane={lane_no}/{ARCHIVE_LATEST_NAME}"
+        s3.copy_object(Bucket=S3_BUCKET, CopySource={"Bucket": S3_BUCKET, "Key": key}, Key=latest_key)
+
+    s3.delete_object(Bucket=S3_BUCKET, Key=key)
+
+
 
 # ===================== INPUT GATHERING =====================
 def gather_input_files_local(input_path: str) -> List[Path]:
@@ -1138,7 +1209,6 @@ def main():
         return
 
     conn = get_conn()
-    print('DB:', db_fingerprint(conn))
     print(f"WORKER_MODE={WORKER_MODE} TENANT_FILTER={'ALL' if not TENANT_FILTER else ','.join(sorted(TENANT_FILTER))}")
     try:
         tenant_id_single = resolve_tenant_id(conn) if WORKER_MODE == "single" else None
@@ -1303,6 +1373,8 @@ def main():
                 "lane_no": int(lane_no),
                 "source_file": filename,
                 "s3_key": key,
+                "tenant_value": s3_tenant_value,
+                "address_value": address_value,
                 "s3_etag": (s3_meta.get("ETag") if s3_meta else None),
                 "last_modified": (s3_meta.get("LastModified") if s3_meta else None),
                 "last_size": int(object_size or 0),
@@ -1319,13 +1391,6 @@ def main():
 
         print(f"Parsed {len(all_rows)} rows → {len(final_rows)} after de-dup (by bill)")
 
-        # Validate FK targets (locations) to avoid hard crash and to expose DB mismatch
-        bad_locs = sorted({r.get("location_id") for r in final_rows if r.get("location_id") and not location_exists(conn, r.get("location_id"))})
-        if bad_locs:
-            print("ERROR: Some location_id values are missing in locations table on this DB. Skipping those rows.")
-            print("Missing location_id(s):", ", ".join(bad_locs[:20]) + ("..." if len(bad_locs) > 20 else ""))
-            final_rows = [r for r in final_rows if r.get("location_id") and location_exists(conn, r.get("location_id"))]
-            print(f"Remaining rows after FK filter: {len(final_rows)}")
         inserted = batch_upsert(conn, final_rows)
         print(f"✅ Upserted {inserted} rows into pos")
 
@@ -1348,6 +1413,11 @@ def main():
                 last_modified=off.get("last_modified"),
                 last_size=int(off.get("last_size") or 0),
             )
+
+            # After a successful upsert+offset save, archive and delete the source file
+            if off.get("s3_key"):
+                archive_and_delete_s3_object(off["s3_key"], tenant_value=off.get("tenant_value"), address_value=off.get("address_value"), lane_no=lane)
+
 
     finally:
         conn.close()
