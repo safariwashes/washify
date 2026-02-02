@@ -974,6 +974,12 @@ def parse_tenant_value_from_key(key: str) -> Optional[str]:
     m = re.search(r"(?:^|/)tenant=([^/]+)(?:/|$)", key, flags=re.IGNORECASE)
     return m.group(1) if m else None
 
+def parse_address_value_from_key(key: str) -> Optional[str]:
+    if not key:
+        return None
+    m = re.search(r"(?:^|/)address=([^/]+)(?:/|$)", key, flags=re.IGNORECASE)
+    return m.group(1) if m else None
+
 
 def resolve_tenant_id_from_s3_value(conn, s3_tenant_value: str) -> Optional[str]:
     if not s3_tenant_value:
@@ -1373,8 +1379,8 @@ def main():
                 "lane_no": int(lane_no),
                 "source_file": filename,
                 "s3_key": key,
-                "tenant_value": s3_tenant_value,
-                "address_value": address_value,
+                "tenant_value": parse_tenant_value_from_key(key),
+                "address_value": parse_address_value_from_key(key),
                 "s3_etag": (s3_meta.get("ETag") if s3_meta else None),
                 "last_modified": (s3_meta.get("LastModified") if s3_meta else None),
                 "last_size": int(object_size or 0),
