@@ -1,33 +1,3 @@
-"""
-pos_ingest_multi_tenant.py
-
-Multi-tenant version of the kiosk Transaction log ingester.
-
-What this script does
-- Pulls the latest Transaction*.txt file(s) from S3 (or reads local INPUT_PATH for testing)
-- Parses sessions in the file and extracts POS fields (bill, timestamps, plate, customer, package, add-ons, totals, etc.)
-- Resolves tenant_id + location_id from database tables (no hard-coded FRA/NSH mapping)
-- Resolves wash_type using DB-driven rules (no hard-coded wash-type map)
-- Upserts into public.pos
-
-Key DB tables used (created automatically if missing):
-1) tenants (existing in your schema)
-   - expected columns: tenant_id (uuid), tenant_slug (text) OR slug-like column
-2) locations (existing in your schema)
-   - expected columns: location_id (uuid), tenant_id (uuid), location_code (text) (or similar)
-3) kiosk_file_rules (created by this script)
-   - maps filename patterns -> location_id + lane_no (+ optional location_code label)
-4) wash_type_rules (created by this script)
-   - maps wash_package_name patterns -> normalized wash_type (Basic/Good/Better/Best/Super)
-
-Environment
-- DATABASE_URL (recommended) OR DB_NAME/DB_USER/DB_PASS/DB_HOST/DB_PORT/DB_SSLMODE
-- TENANT_ID (uuid) OR TENANT_SLUG (text)  [TENANT_ID wins]
-- AWS_REGION, S3_BUCKET, S3_PREFIX, FILE_MATCH
-- INPUT_PATH (optional): local file or directory for testing
-- DELETE_S3_AFTER_SUCCESS (default: "true")
-"""
-
 import os
 import re
 import json
@@ -77,13 +47,6 @@ BUFFER_LINES = int(os.getenv("BUFFER_LINES", "2000"))
 BUFFER_BYTES = int(os.getenv("BUFFER_BYTES", "200000"))  # ~200KB
 
 # S3 folder layout support
-# Two common layouts:
-#   1) plain:        {S3_PREFIX}/.../Transaction*.txt
-#   2) partitioned:  {S3_PREFIX}/tenant=<tenant_value>/address=<addr>/lane=<n>/Transaction*.txt
-#
-# Configure via:
-#   S3_LAYOUT=plain|partitioned   (default: plain)
-#   S3_TENANT_VALUE=<value>       (only used when S3_LAYOUT=partitioned; example: safariexpresswash)
 S3_LAYOUT = (os.getenv("S3_LAYOUT") or "plain").strip().lower()
 S3_TENANT_VALUE = (os.getenv("S3_TENANT_VALUE") or "").strip()
 WORKER_MODE = (os.getenv("WORKER_MODE") or "multi").strip().lower()  # multi|single
@@ -103,11 +66,7 @@ DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "https://drbwashifyimages.s3.amazonaws.com/").rstrip("/")
 
 def normalize_image_path(raw: Optional[str], bill: Optional[int] = None) -> Optional[str]:
-    """Convert kiosk 'Aws File Name ...' value to a full URL.
-
-    Example raw: 'Server_10/103/171/IpCameraImages/27502577'
-    Output: 'https://drbwashifyimages.s3.amazonaws.com/Server_10/103/171/IpCameraImages/27502577_Full.jpg'
-    """
+    """Convert kiosk 'Aws File Name ...' value to a full URL."""
     if not raw:
         return None
     s = str(raw).strip()
@@ -116,7 +75,6 @@ def normalize_image_path(raw: Optional[str], bill: Optional[int] = None) -> Opti
     if s.lower().startswith(("http://", "https://")):
         return s
 
-    # Keep only the path part if the log includes a prefix like "Aws File Name".
     s = re.sub(r"^Aws File Name\s+", "", s, flags=re.IGNORECASE).strip()
 
     if "Server_10/" in s and "/IpCameraImages/" in s:
@@ -230,9 +188,7 @@ def resolve_tenant_id(conn) -> str:
     if not TENANT_SLUG:
         raise RuntimeError("Missing TENANT_ID or TENANT_SLUG environment variable.")
 
-    # Try common slug column names
     with conn.cursor() as cur:
-        # 1) tenant_slug
         cur.execute(
             """
             SELECT tenant_id
@@ -246,7 +202,6 @@ def resolve_tenant_id(conn) -> str:
         if row:
             return str(row[0])
 
-        # 2) slug
         cur.execute(
             """
             SELECT tenant_id
@@ -306,7 +261,6 @@ def load_wash_type_rules(conn, tenant_id: str) -> List[Dict[str, Any]]:
         )
         rules = list(cur.fetchall())
 
-    # Precompile regex rules
     for r in rules:
         if r["match_type"] == "regex":
             try:
@@ -396,17 +350,7 @@ def save_ingest_offset(
     conn.commit()
 
 
-
 def infer_location_and_lane_from_rules(key_hint: str, rules: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[int], Optional[str]]:
-    """
-    Returns (location_id, lane_no, location_code_label) by matching filename_contains against a key hint.
-
-    key_hint can be either:
-      - the basename filename (plain layout), OR
-      - the full S3 key (partitioned layout like .../address=.../lane=.../Transaction_...txt)
-
-    We match using simple case-insensitive substring search against key_hint.
-    """
     fn = (key_hint or "").lower()
     for r in rules:
         if (r.get("filename_contains") or "").lower() in fn:
@@ -415,11 +359,7 @@ def infer_location_and_lane_from_rules(key_hint: str, rules: List[Dict[str, Any]
 
 
 def lookup_location_code(conn, location_id: str) -> Optional[str]:
-    """
-    Reads the human label/location code from locations table if present.
-    """
     with conn.cursor() as cur:
-        # Try common column names
         cur.execute(
             """
             SELECT
@@ -432,6 +372,36 @@ def lookup_location_code(conn, location_id: str) -> Optional[str]:
         )
         row = cur.fetchone()
         return row[0] if row else None
+
+
+# ===================== NEW: WASH_RECURRING LOOKUP (TENANT-SCOPED) =====================
+def load_wash_recurring_map(conn, tenant_id: str) -> Dict[int, Dict[str, Any]]:
+    """
+    Map wash_package_id (ServiceID number) -> package info, filtered by tenant_id.
+    Expects wash_recurring has: tenant_id, wash_package_id, wash_package_name, wash_type
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT wash_package_id, wash_package_name, wash_type
+            FROM wash_recurring
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        )
+        rows = list(cur.fetchall())
+    for r in rows:
+        try:
+            pid = int(r["wash_package_id"])
+        except Exception:
+            continue
+        out[pid] = {
+            "wash_package_id": pid,
+            "wash_package_name": r.get("wash_package_name"),
+            "wash_type": r.get("wash_type"),
+        }
+    return out
 
 
 # ===================== PARSING REGEX =====================
@@ -460,6 +430,12 @@ CUSTOMER_NAME_RE = re.compile(r"Customer Name\s+([^,]+)", re.IGNORECASE)
 UNLIMITED_NEW_RE   = re.compile(r"NEW CUSTOMER\s*->", re.IGNORECASE)
 UNLIMITED_RECUR_RE = re.compile(r"RECURRING\s*->", re.IGNORECASE)
 
+# ===================== NEW: KEY INDICATOR FOR RECURRING (USER REQUEST) =====================
+MESSAGE_RECURRING_RE = re.compile(r"Message\s*=\s*RECURRING\b", re.IGNORECASE)
+
+# ===================== NEW: ServiceID extraction for recurring unlimited =====================
+SERVICE_ID_RE = re.compile(r"ServiceID\s*(\d+)", re.IGNORECASE)
+
 TIP_AMOUNT_RE = re.compile(r"\bTip\s*\$?\s*([0-9]+(?:\.[0-9]{1,2})?)\b", re.IGNORECASE)
 
 DISCOUNT_BOTH_RE   = re.compile(r"Discount[:\s]+([A-Za-z0-9._-]+)\s+\$?([0-9]+(?:\.[0-9]{1,2})?)", re.IGNORECASE)
@@ -471,9 +447,6 @@ TOTAL_RE = re.compile(r"Total[:\s]+\$?([0-9]+(?:\.[0-9]{1,2})?)\b", re.IGNORECAS
 
 
 def parse_ts(line: str) -> Tuple[Optional[datetime], str]:
-    """
-    Extracts the leading timestamp (if present) and returns (datetime, rest_of_line).
-    """
     m = TS_RE.match(line)
     if not m:
         return None, line
@@ -482,7 +455,6 @@ def parse_ts(line: str) -> Tuple[Optional[datetime], str]:
 
 
 def find_last_bill_index(lines: List[str], last_bill: Optional[int]) -> Optional[int]:
-    """Search backwards in the lines to find the last occurrence of last_bill. Returns index or None."""
     if last_bill is None:
         return None
     target = str(last_bill)
@@ -505,7 +477,6 @@ def normalize_ws_name(name: Optional[str]) -> Optional[str]:
     s = str(name).strip()
     if not s:
         return None
-    # Kiosk sometimes logs: 'Customer Name  PD50230 VehicleID... ServiceID...'
     for stop in ["VehicleID", "ServiceID", "ServiceName", "VehicleId", "ServiceId"]:
         if stop in s:
             s = s.split(stop, 1)[0].strip()
@@ -514,14 +485,6 @@ def normalize_ws_name(name: Optional[str]) -> Optional[str]:
 
 
 def map_wash_type_from_rules(pkg_name: Optional[str], rules: List[Dict[str, Any]]) -> Optional[str]:
-    """
-    Convert wash_package_name into normalized wash_type using DB rules.
-    Rule evaluation order: priority ASC, rule_id ASC (already sorted by query).
-    match_type:
-      - contains: case-insensitive substring match
-      - exact: case-insensitive full-string match
-      - regex: pattern compiled with IGNORECASE
-    """
     if not pkg_name:
         return None
 
@@ -554,15 +517,6 @@ def parse_file(
     location_label: Optional[str] = None,
     lane_no: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Parse a single Transaction log file into POS rows.
-
-    Key behaviors (important for SIGNUP flows):
-      - We DO NOT end a session on ResetTransaction (kiosk can reset mid-flow and still continue the same signup).
-      - We accept Wash Package lines from ANY screen (PaymentScreenViewModel / ProceedToCarWashViewModel / etc.).
-      - If a later non-zero InvoiceID appears, we update to the latest invoice within the session.
-      - Tips are detected from "Wash Package ... Tip $X" and added to tip_amount (and not treated as wash type).
-    """
     sessions: List[Dict[str, Any]] = []
     sess: Optional[Dict[str, Any]] = None
 
@@ -577,6 +531,10 @@ def parse_file(
             # main wash package (what becomes wash_type)
             "wash_package_id": None,
             "wash_package_name": None,
+
+            # NEW: for recurring unlimited lookup
+            "service_id": None,
+            "saw_message_recurring": False,
 
             # payment / receipt / image
             "payment_type": None,
@@ -611,6 +569,7 @@ def parse_file(
             or s.get("payment_type")
             or s.get("saw_unlimited_signature")
             or s.get("saw_creditcard_unlimited")
+            or s.get("saw_message_recurring")
         )
 
     def end_session(ts: Optional[datetime]):
@@ -622,7 +581,6 @@ def parse_file(
         sessions.append(sess)
         sess = None
 
-    # Load lines
     if preloaded_lines is not None:
         lines = preloaded_lines
     else:
@@ -660,7 +618,13 @@ def parse_file(
                 if inv and inv != "0":
                     sess["invoice"] = inv
 
-        # ----- Unlimited markers -----
+        # ----- NEW: Message=RECURRING indicator (requested) -----
+        if MESSAGE_RECURRING_RE.search(content):
+            sess["unlimited_type"] = "RECURRING"
+            sess["unlimited_ts"] = ts or sess["unlimited_ts"]
+            sess["saw_message_recurring"] = True
+
+        # ----- Unlimited markers (keep existing behavior untouched) -----
         if UNLIMITED_NEW_RE.search(content):
             if not sess["unlimited_type"]:
                 sess["unlimited_type"] = "NEW"
@@ -674,6 +638,14 @@ def parse_file(
             sess["saw_unlimited_signature"] = True
         if "CreditCardUnlimitedViewModel" in content:
             sess["saw_creditcard_unlimited"] = True
+
+        # ----- NEW: ServiceID capture for recurring unlimited -----
+        m = SERVICE_ID_RE.search(content)
+        if m:
+            try:
+                sess["service_id"] = int(m.group(1))
+            except Exception:
+                pass
 
         # ----- Customer -----
         m = CUSTOMER_NAME_RE.search(content)
@@ -691,7 +663,6 @@ def parse_file(
             pkg_id = m.group(1).strip()
             pkg_name = normalize_ws_name(m.group(2).rstrip("."))
 
-            # Tip often shows up as "Wash Package <id> with Name Tip $10"
             tip_m = TIP_AMOUNT_RE.search(pkg_name) or TIP_AMOUNT_RE.search(content)
             is_tip = bool(tip_m) or pkg_name.lower().startswith("tip")
             if is_tip:
@@ -769,7 +740,6 @@ def parse_file(
         if "ProceedToCarWashViewModel" in content and "ReturnToMainScreen" in content:
             end_session(ts)
 
-    # flush trailing
     if sess and has_meaningful_data(sess):
         sessions.append(sess)
 
@@ -785,11 +755,18 @@ def parse_file(
         strong_signup = bool(s["saw_unlimited_signature"] or s["saw_creditcard_unlimited"])
         strong_wash = bool(s["saw_unlimited_pkg_name"])
 
+        # NEW: recurring via Message=RECURRING should mark unlimited
+        recurring_msg = bool(s.get("saw_message_recurring"))
+
         if strong_signup:
             invoice_kind = "SIGNUP"
             is_unl = True
             if not s["unlimited_type"]:
                 s["unlimited_type"] = "NEW"
+        elif recurring_msg:
+            invoice_kind = "WASH"
+            is_unl = True
+            s["unlimited_type"] = "RECURRING"
         elif strong_wash:
             invoice_kind = "WASH"
             is_unl = True
@@ -823,6 +800,9 @@ def parse_file(
                 "created_on": now_cst_date(),
                 "created_at": now_cst_time(),
                 "invoice_kind": invoice_kind,
+
+                # NEW: carry service_id for enrichment later (not written unless used to fill fields)
+                "service_id": s.get("service_id"),
             }
         )
 
@@ -877,7 +857,6 @@ ON CONFLICT (tenant_id, location_id, bill, wash_date) DO UPDATE SET
   source_file       = COALESCE(pos.source_file, EXCLUDED.source_file),
   invoice_kind      = COALESCE(pos.invoice_kind, EXCLUDED.invoice_kind),
 
-  -- tenant/location should not change once set; only fill if NULL (defensive)
   tenant_id         = COALESCE(pos.tenant_id, EXCLUDED.tenant_id),
   location_id       = COALESCE(pos.location_id, EXCLUDED.location_id);
 """
@@ -898,9 +877,6 @@ def batch_upsert(conn, rows: List[Dict[str, Any]], batch_size: int = 500) -> int
 
 # ===================== LAST BILL (TENANT + LOCATION + TODAY) =====================
 def get_last_bill_for_today(conn, tenant_id: str, location_id: str) -> Optional[int]:
-    """
-    Find today's latest bill for a tenant + location based on wash_date (derived from wash_ts_first).
-    """
     today = now_cst_date()
     with conn.cursor() as cur:
         cur.execute(
@@ -919,7 +895,6 @@ def get_last_bill_for_today(conn, tenant_id: str, location_id: str) -> Optional[
         return row[0] if row else None
 
 def get_last_bill_for_today_lane(conn, tenant_id: str, location_id: str, lane_no: int) -> Optional[int]:
-    """Find today's latest bill for a tenant + location + lane."""
     today = now_cst_date()
     with conn.cursor() as cur:
         cur.execute(
@@ -946,7 +921,6 @@ def get_s3_client():
 
 
 def parse_lane_from_key_hint(key_hint: Optional[str]) -> Optional[int]:
-    """Extract lane number from either a partitioned S3 key (.../lane=1/...) or the legacy filename (_1_Transaction...)."""
     if not key_hint:
         return None
     s = str(key_hint)
@@ -998,19 +972,7 @@ def resolve_tenant_id_from_s3_value(conn, s3_tenant_value: str) -> Optional[str]
         return str(row[0]) if row else None
 
 
-    m = re.search(r"_(\d+)_transaction", s, flags=re.IGNORECASE)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-
-    return None
-
 def latest_s3_objects(prefix: str, file_match: str, limit: int = 5) -> List[dict]:
-    """
-    Returns up to `limit` newest objects under prefix that contain file_match in basename.
-    """
     if not S3_BUCKET:
         raise RuntimeError("S3_BUCKET is required when not using INPUT_PATH.")
     s3 = get_s3_client()
@@ -1043,7 +1005,6 @@ def head_s3_object(key: str) -> Dict[str, Any]:
 
 
 def read_s3_range(key: str, start: int, end: Optional[int] = None) -> bytes:
-    """Read bytes from S3 object using Range header."""
     s3 = get_s3_client()
     if start < 0:
         start = 0
@@ -1055,13 +1016,11 @@ def read_s3_range(key: str, start: int, end: Optional[int] = None) -> bytes:
     return obj["Body"].read()
 
 
-
 def delete_s3_object(key: str):
     s3 = get_s3_client()
     s3.delete_object(Bucket=S3_BUCKET, Key=key)
 
 def archive_and_delete_s3_object(key: str, tenant_value: Optional[str]=None, address_value: Optional[str]=None, lane_no: Optional[int]=None):
-    """Archive processed file to S3 (overwrite latest), then delete original."""
     if not ARCHIVE_ENABLED:
         return
     s3 = get_s3_client()
@@ -1089,22 +1048,6 @@ def gather_input_files_local(input_path: str) -> List[Path]:
 
 # ===================== OPTIONAL SEEDING (DB DRIVEN, NOT HARDCODED IN LOGIC) =====================
 def seed_rules_if_empty(conn, tenant_id: str):
-    """
-    If you want to ship sensible defaults without hardcoding logic, you can seed via env JSON.
-    This function only seeds when the rule tables are empty for this tenant.
-
-    Env JSON formats:
-      KIOSK_FILE_RULES_JSON: [
-        {"filename_contains":"1004 center point pl","location_code":"FRA","lane_no":1},
-        ...
-      ]
-      WASH_TYPE_RULES_JSON: [
-        {"match_type":"contains","pattern":"basic","wash_type":"Basic","priority":10},
-        ...
-      ]
-
-    For kiosk file rules we still need location_id; so seeding expects location_code and it looks up location_id.
-    """
     kiosk_json = (os.getenv("KIOSK_FILE_RULES_JSON") or "").strip()
     wash_json = (os.getenv("WASH_TYPE_RULES_JSON") or "").strip()
 
@@ -1187,11 +1130,9 @@ def main():
         for f in files:
             file_entries.append((f, str(f)))
     else:
-        # S3 mode - list newest Transaction files (supports multi-tenant folder prefixes)
         if not S3_BUCKET:
             raise RuntimeError("S3_BUCKET is required when not using INPUT_PATH.")
 
-        # Effective prefix (multi-tenant folder support)
         effective_prefix = S3_PREFIX
         if S3_LAYOUT == "partitioned":
             if WORKER_MODE == "single":
@@ -1220,18 +1161,16 @@ def main():
         tenant_id_single = resolve_tenant_id(conn) if WORKER_MODE == "single" else None
         ensure_rule_tables(conn)
 
-        # optional seeding via env JSON (only if empty) - single tenant only
         if WORKER_MODE == "single" and tenant_id_single:
             seed_rules_if_empty(conn, tenant_id_single)
 
         rules_cache = {}  # tenant_id -> (kiosk_rules, wash_type_rules)
-
+        recurring_cache = {}  # tenant_id -> wash_recurring map (service_id -> fields)
 
         all_rows: List[Dict[str, Any]] = []
         offsets_pending: List[Dict[str, Any]] = []
 
         for local_path, source_hint in file_entries:
-            # source_hint is either a local path string (INPUT_PATH mode) or an S3 key (S3 mode)
             if local_path is None:
                 key = source_hint
                 filename = os.path.basename(key)
@@ -1241,13 +1180,11 @@ def main():
 
             key_hint = key or filename
 
-            # Resolve tenant_id for this file
             tenant_id = None
             if WORKER_MODE == "single":
                 tenant_id = tenant_id_single
             else:
                 if not key:
-                    # Local mode with multi is ambiguous; use single mode for local testing
                     tenant_id = tenant_id_single
                 else:
                     tval = parse_tenant_value_from_key(key)
@@ -1266,7 +1203,6 @@ def main():
                 print(f"Skipping file (tenant_id unresolved): {filename}")
                 continue
 
-            # Load rules for this tenant (cached)
             if tenant_id not in rules_cache:
                 kiosk_rules_t = load_kiosk_file_rules(conn, tenant_id)
                 wash_rules_t = load_wash_type_rules(conn, tenant_id)
@@ -1283,10 +1219,8 @@ def main():
                 print(f"Skipping file (no lane_no resolved): {filename} (hint: {key_hint})")
                 continue
 
-            # Prefer label from rule; otherwise pull from locations table
             location_label = location_code_label or lookup_location_code(conn, location_id)
 
-            # Load last-ingest offset (per tenant + location + lane + filename)
             offset_row = load_ingest_offset(conn, tenant_id, location_id, int(lane_no), filename)
 
             lines: List[str] = []
@@ -1294,7 +1228,6 @@ def main():
             s3_meta = None
 
             if key:
-                # S3 mode: read only the tail using the stored byte offset
                 s3_meta = head_s3_object(key)
                 object_size = int(s3_meta.get("ContentLength") or 0)
 
@@ -1302,24 +1235,20 @@ def main():
                 same_key = bool(offset_row and (offset_row.get("s3_key") == key))
 
                 if same_key and last_byte > 0 and object_size > last_byte:
-                    # Read from a little before last_byte to preserve session context
                     start_byte = max(last_byte - BUFFER_BYTES, 0)
                     b = read_s3_range(key, start_byte)
                     txt = b.decode("utf-8", errors="ignore")
                     lines = txt.splitlines()
                     if start_byte > 0 and lines:
-                        # first line may be truncated mid-line
                         lines = lines[1:]
                     print(f"Tail-read s3://{S3_BUCKET}/{key} from byte {start_byte} (prev={last_byte}, size={object_size})")
                 else:
-                    # New file day or first run: download full file
                     print(f"Downloading full s3://{S3_BUCKET}/{key} (size={object_size}) ...")
                     local_path = download_s3_to_temp(key)
                     with local_path.open("r", encoding="utf-8", errors="ignore") as fh:
                         lines = fh.readlines()
 
             else:
-                # Local mode
                 assert local_path is not None
                 object_size = local_path.stat().st_size
                 last_byte = int((offset_row or {}).get("last_byte_offset") or 0)
@@ -1339,7 +1268,6 @@ def main():
 
             print(f"File: {filename} → tenant_id={tenant_id}, location_id={location_id}, lane={lane_no}, label={location_label}")
 
-            # Determine last bill for safe start point
             last_bill = (offset_row or {}).get("last_bill")
             if last_bill is None:
                 last_bill = get_last_bill_for_today_lane(conn, tenant_id, location_id, int(lane_no))
@@ -1355,7 +1283,7 @@ def main():
             else:
                 start_idx = 0
                 print("No existing rows today for this tenant/location; parsing provided content from start.")
-            # Parse
+
             parse_path = local_path or (Path(tempfile.gettempdir()) / filename)
             parsed_rows = parse_file(
                 parse_path,
@@ -1366,13 +1294,41 @@ def main():
                 lane_no=lane_no,
             )
 
-            # add tenant + location ids
             for r in parsed_rows:
                 r["tenant_id"] = tenant_id
                 r["location_id"] = location_id
 
+            # ===================== NEW: fill recurring wash package fields via wash_recurring (tenant-scoped) =====================
+            if parsed_rows:
+                if tenant_id not in recurring_cache:
+                    recurring_cache[tenant_id] = load_wash_recurring_map(conn, tenant_id)
+                rec_map = recurring_cache[tenant_id]
+
+                for r in parsed_rows:
+                    if r.get("unlimited_type") != "RECURRING":
+                        continue
+                    sid = r.get("service_id")
+                    if not sid:
+                        continue
+
+                    # Only fill when Washify didn't provide it
+                    if r.get("wash_package_id") and r.get("wash_package_name") and r.get("wash_type"):
+                        continue
+
+                    rec = rec_map.get(int(sid))
+                    if not rec:
+                        continue
+
+                    if not r.get("wash_package_id"):
+                        r["wash_package_id"] = rec.get("wash_package_id")
+                    if not r.get("wash_package_name"):
+                        r["wash_package_name"] = rec.get("wash_package_name")
+                    if not r.get("wash_type"):
+                        r["wash_type"] = rec.get("wash_type")
+            # ====================================================================================================================
+
             all_rows.extend(parsed_rows)
-            # Track offset update for this lane/file (even if parsed_rows is empty, we may advance offset)
+
             offsets_pending.append({
                 "tenant_id": tenant_id,
                 "location_id": location_id,
@@ -1386,8 +1342,6 @@ def main():
                 "last_size": int(object_size or 0),
             })
 
-                # De-dup by logical key (tenant_id, location_id, bill, wash_date)
-        # wash_date is derived from wash_ts_first (same as the generated column in DB).
         dedup: Dict[tuple, Dict[str, Any]] = {}
         for r in all_rows:
             wdate = r.get("wash_ts_first").date() if r.get("wash_ts_first") else None
@@ -1400,7 +1354,6 @@ def main():
         inserted = batch_upsert(conn, final_rows)
         print(f"✅ Upserted {inserted} rows into pos")
 
-        # Persist last byte offsets per lane/file (per tenant/location)
         for off in offsets_pending:
             lane = int(off["lane_no"])
             loc_id = off["location_id"]
@@ -1420,15 +1373,11 @@ def main():
                 last_size=int(off.get("last_size") or 0),
             )
 
-            # After a successful upsert+offset save, archive and delete the source file
             if off.get("s3_key"):
                 archive_and_delete_s3_object(off["s3_key"], tenant_value=off.get("tenant_value"), address_value=off.get("address_value"), lane_no=lane)
 
-
     finally:
         conn.close()
-
-    # NOTE: S3 objects are not deleted (append-only daily files; offsets handle incremental ingestion)
 
 
 
