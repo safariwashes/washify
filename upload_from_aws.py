@@ -509,6 +509,7 @@ def map_wash_type_from_rules(pkg_name: Optional[str], rules: List[Dict[str, Any]
 
 
 # ===================== PARSER =====================
+
 def parse_file(
     path: Path,
     wash_type_rules: List[Dict[str, Any]],
@@ -520,126 +521,66 @@ def parse_file(
     sessions: List[Dict[str, Any]] = []
     sess: Optional[Dict[str, Any]] = None
 
-    def new_session(ts: Optional[datetime]):
+    def new_session():
         return {
             "invoice": None,
-            "first_ts": ts,
-            "last_ts": ts,
+            "txn_start_ts": None,
+            "finalize_ts": None,
+            "first_ts": None,
+            "last_ts": None,
             "customer_name": None,
             "license_plate": None,
-
-            # main wash package (what becomes wash_type)
             "wash_package_id": None,
             "wash_package_name": None,
-
-            # NEW: for recurring unlimited lookup
+            "wash_type": None,
+            "final_wash_locked": False,
             "service_id": None,
-            "saw_message_recurring": False,
-
-            # payment / receipt / image
-            "payment_type": None,
-            "payment_type_ts": None,
-            "image_path": None,
-
-            # unlimited classification
             "unlimited_type": None,
-            "unlimited_ts": None,
-            "saw_unlimited_signature": False,
-            "saw_creditcard_unlimited": False,
-            "saw_unlimited_pkg_name": False,
-
-            # add-ons / tips / discounts / totals
-            "addon_map": {},  # pkg_id -> {name, ts}
+            "saw_message_recurring": False,
+            "payment_type": None,
+            "image_path": None,
+            "addon_map": {},
             "tip_amount": 0.0,
-            "tip_ts": None,
-
-            "discount_code": None,
-            "discount_amount": None,
-            "tax": None,
-            "total": None,
         }
 
-    def has_meaningful_data(s: Dict[str, Any]) -> bool:
-        return bool(
-            (s.get("invoice") and s["invoice"] != "0")
-            or s.get("wash_package_name")
-            or s.get("license_plate")
-            or s.get("customer_name")
-            or s.get("image_path")
-            or s.get("payment_type")
-            or s.get("saw_unlimited_signature")
-            or s.get("saw_creditcard_unlimited")
-            or s.get("saw_message_recurring")
-        )
-
-    def end_session(ts: Optional[datetime]):
+    def end_session():
         nonlocal sess
-        if not sess:
-            return
-        if ts and (not sess["last_ts"] or ts > sess["last_ts"]):
-            sess["last_ts"] = ts
-        sessions.append(sess)
+        if sess:
+            sessions.append(sess)
         sess = None
 
-    if preloaded_lines is not None:
-        lines = preloaded_lines
-    else:
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
+    lines = preloaded_lines if preloaded_lines is not None else path.read_text(errors="ignore").splitlines()
 
     for raw in lines[start_index:]:
-        line = raw.strip()
-        if not line:
+        ts, content = parse_ts(raw.strip())
+        if not content:
             continue
 
-        ts, content = parse_ts(line)
-
         if sess is None:
-            sess = new_session(ts)
+            sess = new_session()
 
         if ts:
-            if not sess["first_ts"] or ts < sess["first_ts"]:
-                sess["first_ts"] = ts
-            if not sess["last_ts"] or ts > sess["last_ts"]:
-                sess["last_ts"] = ts
+            sess["first_ts"] = sess["first_ts"] or ts
+            sess["last_ts"] = ts
 
-        # ----- Explicit new-transaction start marker -----
-        if "AdjustScreenViewModel" in content and "Adjust screen started" in content:
-            if sess and has_meaningful_data(sess):
-                end_session(ts)
-            if sess is None:
-                sess = new_session(ts)
+        if ts and sess["txn_start_ts"] is None:
+            if (
+                "SelectServiceBlock" in content
+                or "PaymentScreenViewModel" in content
+                or "UnlimitedProcessing" in content
+                or MESSAGE_RECURRING_RE.search(content)
+            ):
+                sess["txn_start_ts"] = ts
 
-        # ----- Invoice detection (keep the latest non-zero invoice) -----
-        for regex in INVOICE_SEARCH_RES:
-            m = regex.search(content)
-            if m:
-                inv = m.group(1)
-                if inv and inv != "0":
-                    sess["invoice"] = inv
+        for rx in INVOICE_SEARCH_RES:
+            m = rx.search(content)
+            if m and m.group(1) != "0":
+                sess["invoice"] = m.group(1)
 
-        # ----- NEW: Message=RECURRING indicator (requested) -----
         if MESSAGE_RECURRING_RE.search(content):
             sess["unlimited_type"] = "RECURRING"
-            sess["unlimited_ts"] = ts or sess["unlimited_ts"]
             sess["saw_message_recurring"] = True
 
-        # ----- Unlimited markers (keep existing behavior untouched) -----
-        if UNLIMITED_NEW_RE.search(content):
-            if not sess["unlimited_type"]:
-                sess["unlimited_type"] = "NEW"
-            sess["unlimited_ts"] = ts or sess["unlimited_ts"]
-
-        if UNLIMITED_RECUR_RE.search(content):
-            sess["unlimited_type"] = "RECURRING"
-            sess["unlimited_ts"] = ts or sess["unlimited_ts"]
-
-        if "UnlimitedCustomerSignatureViewModel" in content:
-            sess["saw_unlimited_signature"] = True
-        if "CreditCardUnlimitedViewModel" in content:
-            sess["saw_creditcard_unlimited"] = True
-
-        # ----- NEW: ServiceID capture for recurring unlimited -----
         m = SERVICE_ID_RE.search(content)
         if m:
             try:
@@ -647,164 +588,64 @@ def parse_file(
             except Exception:
                 pass
 
-        # ----- Customer -----
-        m = CUSTOMER_NAME_RE.search(content)
-        if m and not sess["customer_name"]:
-            sess["customer_name"] = normalize_ws_name(m.group(1))
-
-        # ----- Plate -----
-        m = LICENSE_PLATE_RE.search(content)
-        if m and not sess["license_plate"]:
-            sess["license_plate"] = m.group(1).strip().upper()
-
-        # ----- Wash package / Add-ons / Tip handling -----
         m = WASH_PKG_RE.search(content)
         if m:
-            pkg_id = m.group(1).strip()
-            pkg_name = normalize_ws_name(m.group(2).rstrip("."))
+            pkg_id = m.group(1)
+            pkg_name = normalize_ws_name(m.group(2))
 
             tip_m = TIP_AMOUNT_RE.search(pkg_name) or TIP_AMOUNT_RE.search(content)
-            is_tip = bool(tip_m) or pkg_name.lower().startswith("tip")
-            if is_tip:
+            if tip_m or pkg_name.lower().startswith("tip"):
                 try:
-                    amt = float(tip_m.group(1)) if tip_m else 0.0
-                    if amt > 0:
-                        sess["tip_amount"] = float(sess["tip_amount"] or 0) + amt
-                        sess["tip_ts"] = ts or sess["tip_ts"]
+                    sess["tip_amount"] += float(tip_m.group(1))
                 except Exception:
                     pass
             else:
                 mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
-                is_main_candidate = bool(mapped) or ("unlimited" in pkg_name.lower())
+                if sess["finalize_ts"] and mapped and not sess["final_wash_locked"]:
+                    sess["wash_package_id"] = int(pkg_id)
+                    sess["wash_package_name"] = pkg_name
+                    sess["wash_type"] = mapped
+                    sess["final_wash_locked"] = True
+                elif "SelectOptionalServiceBlock" in content:
+                    sess["addon_map"][pkg_id] = {"name": pkg_name, "ts": ts}
 
-                if "unlimited" in pkg_name.lower():
-                    sess["saw_unlimited_pkg_name"] = True
+        if "ProceedToCarWashViewModel" in content and sess.get("invoice"):
+            sess["finalize_ts"] = ts
 
-                if is_main_candidate:
-                    current_mapped = map_wash_type_from_rules(sess.get("wash_package_name"), wash_type_rules)
-                    if (sess["wash_package_name"] is None) or (current_mapped is None and mapped is not None):
-                        sess["wash_package_id"] = pkg_id
-                        sess["wash_package_name"] = pkg_name
-                else:
-                    if "SelectOptionalServiceBlock" in content:
-                        if pkg_id and pkg_id != str(sess.get("wash_package_id") or ""):
-                            sess["addon_map"][pkg_id] = {"name": pkg_name, "ts": ts}
+        if sess.get("finalize_ts"):
+            end_session()
 
-        # ----- Payment Type -----
-        if "SaveTransactions" in content and "SaveTransaction" in content:
-            m = PAYMENT_TYPE_RE.search(content)
-            if m:
-                sess["payment_type"] = m.group(1).strip()
-                sess["payment_type_ts"] = ts
-
-        # ----- Image Path -----
-        m = AWS_FILE_RE.search(content)
-        if m and not sess["image_path"]:
-            sess["image_path"] = m.group(1).strip()
-
-        # ----- Discount / Tax / Total -----
-        m = DISCOUNT_BOTH_RE.search(content)
-        if m:
-            sess["discount_code"] = m.group(1)
-            try:
-                sess["discount_amount"] = float(m.group(2))
-            except Exception:
-                pass
-
-        m = DISCOUNT_CODE_RE.search(content)
-        if m:
-            sess["discount_code"] = m.group(1)
-
-        m = DISCOUNT_AMOUNT_RE.search(content)
-        if m:
-            try:
-                sess["discount_amount"] = float(m.group(1))
-            except Exception:
-                pass
-
-        m = TAX_RE.search(content)
-        if m:
-            try:
-                sess["tax"] = float(m.group(1))
-            except Exception:
-                pass
-
-        m = TOTAL_RE.search(content)
-        if m:
-            try:
-                sess["total"] = float(m.group(1))
-            except Exception:
-                pass
-
-        # ----- End-of-transaction marker -----
-        if "ProceedToCarWashViewModel" in content and "ReturnToMainScreen" in content:
-            end_session(ts)
-
-    if sess and has_meaningful_data(sess):
+    if sess:
         sessions.append(sess)
 
-    # ----- Convert sessions → DB rows -----
     rows: List[Dict[str, Any]] = []
     for s in sessions:
-        if not s.get("invoice") or s["invoice"] == "0":
+        if not s.get("invoice") or not s.get("finalize_ts"):
             continue
 
-        sorted_addons = sorted(s["addon_map"].values(), key=lambda x: (x["ts"] or datetime.min))
-        addons_text = "; ".join([a["name"] for a in sorted_addons]) if sorted_addons else None
-
-        strong_signup = bool(s["saw_unlimited_signature"] or s["saw_creditcard_unlimited"])
-        strong_wash = bool(s["saw_unlimited_pkg_name"])
-
-        # NEW: recurring via Message=RECURRING should mark unlimited
-        recurring_msg = bool(s.get("saw_message_recurring"))
-
-        if strong_signup:
-            invoice_kind = "SIGNUP"
-            is_unl = True
-            if not s["unlimited_type"]:
-                s["unlimited_type"] = "NEW"
-        elif recurring_msg:
-            invoice_kind = "WASH"
-            is_unl = True
-            s["unlimited_type"] = "RECURRING"
-        elif strong_wash:
-            invoice_kind = "WASH"
-            is_unl = True
-        else:
-            invoice_kind = "NORMAL"
-            is_unl = False
-
-        rows.append(
-            {
-                "bill": int(s["invoice"]),
-                "wash_ts_first": s["first_ts"],
-                "wash_ts_last": s["last_ts"],
-                "license_plate": s["license_plate"],
-                "customer_name": s["customer_name"],
-                "wash_package_id": int(s["wash_package_id"]) if s["wash_package_id"] else None,
-                "wash_package_name": s["wash_package_name"],
-                "wash_type": map_wash_type_from_rules(s["wash_package_name"], wash_type_rules),
-                "payment_type": s["payment_type"],
-                "image_path": normalize_image_path(s.get("image_path"), int(s["invoice"])),
-                "is_unlimited": is_unl,
-                "unlimited_type": s["unlimited_type"] if is_unl else None,
-                "addons": addons_text,
-                "tip_amount": float(s["tip_amount"] or 0),
-                "discount_code": s["discount_code"],
-                "discount_amount": s["discount_amount"],
-                "tax": s["tax"],
-                "total": s["total"],
-                "location": location_label,
-                "lane_no": lane_no,
-                "source_file": path.name,
-                "created_on": now_cst_date(),
-                "created_at": now_cst_time(),
-                "invoice_kind": invoice_kind,
-
-                # NEW: carry service_id for enrichment later (not written unless used to fill fields)
-                "service_id": s.get("service_id"),
-            }
-        )
+        rows.append({
+            "bill": int(s["invoice"]),
+            "wash_ts_first": s["txn_start_ts"],
+            "wash_ts_last": s["finalize_ts"],
+            "wash_package_id": s.get("wash_package_id"),
+            "wash_package_name": s.get("wash_package_name"),
+            "wash_type": s.get("wash_type"),
+            "license_plate": s.get("license_plate"),
+            "customer_name": s.get("customer_name"),
+            "payment_type": s.get("payment_type"),
+            "image_path": normalize_image_path(s.get("image_path"), int(s["invoice"])),
+            "is_unlimited": bool(s.get("unlimited_type")),
+            "unlimited_type": s.get("unlimited_type"),
+            "addons": "; ".join(v["name"] for v in sorted(s["addon_map"].values(), key=lambda x: x["ts"])) if s["addon_map"] else None,
+            "tip_amount": float(s.get("tip_amount") or 0),
+            "location": location_label,
+            "lane_no": lane_no,
+            "source_file": path.name,
+            "created_on": now_cst_date(),
+            "created_at": now_cst_time(),
+            "invoice_kind": "WASH",
+            "service_id": s.get("service_id"),
+        })
 
     return rows
 
