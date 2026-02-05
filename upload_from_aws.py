@@ -1198,7 +1198,7 @@ def main():
 
         # ---------- Normalize rows for UPSERT_SQL ----------
         REQUIRED_KEYS = [
-            "bill","wash_ts_first","wash_ts_last","wash_date","license_plate","customer_name",
+            "bill","wash_ts_first","wash_ts_last","license_plate","customer_name",
             "wash_package_id","wash_package_name","wash_type","payment_type","image_path",
             "is_unlimited","unlimited_type","addons","tip_amount",
             "discount_code","discount_amount","tax","total",
@@ -1214,13 +1214,9 @@ def main():
             r.setdefault("total", 0.0)
 
             # wash_date is REQUIRED (NOT NULL)
-            if not r.get("wash_date"):
-                if r.get("wash_ts_first"):
-                    r["wash_date"] = r["wash_ts_first"].date()
-                elif r.get("wash_ts_last"):
-                    r["wash_date"] = r["wash_ts_last"].date()
-                else:
-                    r["wash_date"] = now_cst_date()
+            # Ensure wash_ts_first exists so Postgres can generate wash_date
+            if not r.get("wash_ts_first"):
+                r["wash_ts_first"] = r.get("wash_ts_last") or now_cst()
 
             # Ensure all SQL placeholders exist
             for k in REQUIRED_KEYS:
