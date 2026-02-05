@@ -1209,14 +1209,13 @@ def main():
             r.setdefault("discount_amount", 0.0)
             r.setdefault("tax", 0.0)
             r.setdefault("total", 0.0)
-    	   if not r.get("wash_date"):
-           if r.get("wash_ts_first"):
-            r["wash_date"] = r["wash_ts_first"].date()
-           elif r.get("wash_ts_last"):
-            r["wash_date"] = r["wash_ts_last"].date()
-           else:
-            # absolute last-resort safety
-            r["wash_date"] = now_cst_date()
+    	           if not r.get("wash_date"):
+                   if r.get("wash_ts_first"):
+                   r["wash_date"] = r["wash_ts_first"].date()
+                   elif r.get("wash_ts_last"):
+                   r["wash_date"] = r["wash_ts_last"].date()
+                   else:
+                   r["wash_date"] = now_cst_date()
 
             for k in REQUIRED_KEYS:
                 r.setdefault(k, None)
