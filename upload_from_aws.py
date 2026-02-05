@@ -600,14 +600,6 @@ def parse_file(
                 sess["wash_package_name"] = sess["pending_wash_package_name"]
                 sess["wash_type"] = sess["pending_wash_type"]
 
-            # 2️⃣ RECURRING fallback
-            if not sess["wash_type"] and sess["unlimited_type"] == "RECURRING":
-                rec = wash_recurring_map.get(sess.get("service_id"))
-                if rec:
-                    sess["wash_package_id"] = rec["wash_package_id"]
-                    sess["wash_package_name"] = rec["wash_package_name"]
-                    sess["wash_type"] = rec["wash_type"]
-
             sess["final_wash_locked"] = True
             end_session()
 
