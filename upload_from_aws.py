@@ -630,6 +630,7 @@ def parse_file(
             "wash_package_id": s.get("wash_package_id"),
             "wash_package_name": s.get("wash_package_name"),
             "wash_type": s.get("wash_type"),
+            "discount_code": None,
             "license_plate": s.get("license_plate"),
             "customer_name": s.get("customer_name"),
             "payment_type": s.get("payment_type"),
