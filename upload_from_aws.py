@@ -509,7 +509,6 @@ def map_wash_type_from_rules(pkg_name: Optional[str], rules: List[Dict[str, Any]
 
 
 # ===================== PARSER =====================
-
 def parse_file(
     path: Path,
     wash_type_rules: List[Dict[str, Any]],
@@ -518,6 +517,7 @@ def parse_file(
     location_label: Optional[str] = None,
     lane_no: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+
     sessions: List[Dict[str, Any]] = []
     sess: Optional[Dict[str, Any]] = None
 
@@ -528,17 +528,20 @@ def parse_file(
             "finalize_ts": None,
             "first_ts": None,
             "last_ts": None,
-            "customer_name": None,
-            "license_plate": None,
+
+            # 🔁 pending (may change)
+            "pending_wash_package_id": None,
+            "pending_wash_package_name": None,
+            "pending_wash_type": None,
+
+            # 🔒 final (locked at proceed)
             "wash_package_id": None,
             "wash_package_name": None,
             "wash_type": None,
             "final_wash_locked": False,
+
             "service_id": None,
             "unlimited_type": None,
-            "saw_message_recurring": False,
-            "payment_type": None,
-            "image_path": None,
             "addon_map": {},
             "tip_amount": 0.0,
         }
@@ -563,15 +566,6 @@ def parse_file(
             sess["first_ts"] = sess["first_ts"] or ts
             sess["last_ts"] = ts
 
-        if ts and sess["txn_start_ts"] is None:
-            if (
-                "SelectServiceBlock" in content
-                or "PaymentScreenViewModel" in content
-                or "UnlimitedProcessing" in content
-                or MESSAGE_RECURRING_RE.search(content)
-            ):
-                sess["txn_start_ts"] = ts
-
         for rx in INVOICE_SEARCH_RES:
             m = rx.search(content)
             if m and m.group(1) != "0":
@@ -579,44 +573,43 @@ def parse_file(
 
         if MESSAGE_RECURRING_RE.search(content):
             sess["unlimited_type"] = "RECURRING"
-            sess["saw_message_recurring"] = True
 
         m = SERVICE_ID_RE.search(content)
         if m:
-            try:
-                sess["service_id"] = int(m.group(1))
-            except Exception:
-                pass
+            sess["service_id"] = int(m.group(1))
 
+        # 🟡 Capture wash as *pending*
         m = WASH_PKG_RE.search(content)
         if m:
-            pkg_id = m.group(1)
+            pkg_id = int(m.group(1))
             pkg_name = normalize_ws_name(m.group(2))
+            mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
 
-            tip_m = TIP_AMOUNT_RE.search(pkg_name) or TIP_AMOUNT_RE.search(content)
-            if tip_m or pkg_name.lower().startswith("tip"):
-                try:
-                    sess["tip_amount"] += float(tip_m.group(1))
-                except Exception:
-                    pass
-            else:
-                mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
-                if sess["finalize_ts"] and mapped and not sess["final_wash_locked"]:
-                    sess["wash_package_id"] = int(pkg_id)
-                    sess["wash_package_name"] = pkg_name
-                    sess["wash_type"] = mapped
-                    sess["final_wash_locked"] = True
-                elif "SelectOptionalServiceBlock" in content:
-                    sess["addon_map"][pkg_id] = {"name": pkg_name, "ts": ts}
+            if mapped:
+                sess["pending_wash_package_id"] = pkg_id
+                sess["pending_wash_package_name"] = pkg_name
+                sess["pending_wash_type"] = mapped
 
+        # ✅ FINALIZATION POINT
         if "ProceedToCarWashViewModel" in content and sess.get("invoice"):
             sess["finalize_ts"] = ts
 
-        if sess.get("finalize_ts"):
-            end_session()
+            # 1️⃣ Lock last chosen wash
+            if sess["pending_wash_type"]:
+                sess["wash_package_id"] = sess["pending_wash_package_id"]
+                sess["wash_package_name"] = sess["pending_wash_package_name"]
+                sess["wash_type"] = sess["pending_wash_type"]
 
-    if sess:
-        sessions.append(sess)
+            # 2️⃣ RECURRING fallback
+            if not sess["wash_type"] and sess["unlimited_type"] == "RECURRING":
+                rec = wash_recurring_map.get(sess.get("service_id"))
+                if rec:
+                    sess["wash_package_id"] = rec["wash_package_id"]
+                    sess["wash_package_name"] = rec["wash_package_name"]
+                    sess["wash_type"] = rec["wash_type"]
+
+            sess["final_wash_locked"] = True
+            end_session()
 
     rows: List[Dict[str, Any]] = []
     for s in sessions:
@@ -630,15 +623,6 @@ def parse_file(
             "wash_package_id": s.get("wash_package_id"),
             "wash_package_name": s.get("wash_package_name"),
             "wash_type": s.get("wash_type"),
-            "discount_code": None,
-            "license_plate": s.get("license_plate"),
-            "customer_name": s.get("customer_name"),
-            "payment_type": s.get("payment_type"),
-            "image_path": normalize_image_path(s.get("image_path"), int(s["invoice"])),
-            "is_unlimited": bool(s.get("unlimited_type")),
-            "unlimited_type": s.get("unlimited_type"),
-            "addons": "; ".join(v["name"] for v in sorted(s["addon_map"].values(), key=lambda x: x["ts"])) if s["addon_map"] else None,
-            "tip_amount": float(s.get("tip_amount") or 0),
             "location": location_label,
             "lane_no": lane_no,
             "source_file": path.name,
@@ -649,7 +633,6 @@ def parse_file(
         })
 
     return rows
-
 
 # ===================== UPSERT INTO POS =====================
 UPSERT_SQL = """
