@@ -1193,6 +1193,27 @@ def main():
 
         print(f"Parsed {len(all_rows)} rows → {len(final_rows)} after de-dup (by bill)")
 
+        
+        # ---------- Normalize rows for UPSERT_SQL (prevent KeyError) ----------
+        REQUIRED_KEYS = [
+            "bill","wash_ts_first","wash_ts_last","license_plate","customer_name",
+            "wash_package_id","wash_package_name","wash_type","payment_type","image_path",
+            "is_unlimited","unlimited_type","addons","tip_amount",
+            "discount_code","discount_amount","tax","total",
+            "location","lane_no","source_file","created_on","created_at","invoice_kind",
+            "tenant_id","location_id",
+        ]
+
+        for r in final_rows:
+            r.setdefault("discount_code", None)
+            r.setdefault("discount_amount", 0.0)
+            r.setdefault("tax", 0.0)
+            r.setdefault("total", 0.0)
+            for k in REQUIRED_KEYS:
+                r.setdefault(k, None)
+        # ---------- END normalize ----------
+
+
         inserted = batch_upsert(conn, final_rows)
         print(f"✅ Upserted {inserted} rows into pos")
 
@@ -1229,122 +1250,4 @@ if __name__ == "__main__":
 
 
 
-# =============================================================
-# PATCH: Finalized POS parsing logic (authoritative)
-# This OVERRIDES the earlier parse_file() definition.
-#
-# Fixes:
-#  - Capture wash ONLY after ProceedToCarWashViewModel
-#  - Prevent tip from hijacking wash
-#  - Suppress duplicate InvoiceID rows
-#  - Suppress aborted/reset flows
-#  - Correct wash_ts_first / wash_ts_last
-#  - Align POS counts with Washify UI (incl Unlimited)
-# =============================================================
 
-def parse_file(path, wash_type_rules, wash_recurring_map):
-    rows = []
-    finalized_bills = set()
-
-    def new_session():
-        return {
-            "first_ts": None,
-            "last_ts": None,
-            "finalize_ts": None,
-            "invoice": None,
-            "finalized": False,
-            "final_wash_locked": False,
-            "wash_package_id": None,
-            "wash_package_name": None,
-            "wash_type": None,
-            "addon_map": {},
-            "tip_amount": 0.0,
-            "unlimited_type": None,
-            "service_id": None,
-        }
-
-    sess = new_session()
-
-    with open(path, "r", errors="ignore") as f:
-        for line in f:
-            m_ts = TS_RE.match(line)
-            if not m_ts:
-                continue
-
-            ts = parse_ts(m_ts.group(1))
-            content = line.strip()
-
-            sess["last_ts"] = ts
-            if not sess["first_ts"]:
-                sess["first_ts"] = ts
-
-            # Invoice detection
-            m_inv = INVOICE_RE.search(content)
-            if m_inv:
-                sess["invoice"] = m_inv.group(1)
-
-            # Unlimited / recurring
-            if "RECURRING" in content:
-                sess["unlimited_type"] = "RECURRING"
-                sm = SERVICE_ID_RE.search(content)
-                if sm:
-                    sess["service_id"] = sm.group(1)
-
-            # FINALIZATION (authoritative boundary)
-            if "ProceedToCarWashViewModel" in content and sess.get("invoice") and sess["invoice"] != "0":
-                sess["finalized"] = True
-                sess["finalize_ts"] = ts
-
-            # Wash / addon / tip handling
-            m = WASH_PKG_RE.search(content)
-            if m:
-                pkg_id = m.group(1).strip()
-                pkg_name = normalize_ws_name(m.group(2))
-
-                # TIP: never a wash
-                if pkg_name.lower().startswith("tip"):
-                    tm = TIP_AMOUNT_RE.search(pkg_name)
-                    if tm:
-                        sess["tip_amount"] += float(tm.group(1))
-                    continue
-
-                mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
-
-                # Lock wash ONLY after finalization
-                if sess["finalized"] and mapped and not sess["final_wash_locked"]:
-                    sess["wash_package_id"] = pkg_id
-                    sess["wash_package_name"] = pkg_name
-                    sess["wash_type"] = mapped
-                    sess["final_wash_locked"] = True
-                else:
-                    if "SelectOptionalServiceBlock" in content:
-                        sess["addon_map"][pkg_id] = pkg_name
-
-            # END SESSION ONLY AFTER FINALIZATION
-            if sess["finalized"]:
-                bill = sess["invoice"]
-                if bill and bill not in finalized_bills:
-                    # Unlimited fallback
-                    if sess["unlimited_type"] == "RECURRING" and not sess["wash_type"]:
-                        rec = wash_recurring_map.get(sess["service_id"])
-                        if rec:
-                            sess["wash_package_id"] = rec["wash_package_id"]
-                            sess["wash_package_name"] = rec["wash_package_name"]
-                            sess["wash_type"] = rec["wash_type"]
-
-                    # FINAL ACCEPTANCE RULE
-                    if sess["wash_type"]:
-                        rows.append({
-                            "bill": int(bill),
-                            "wash_package_id": sess["wash_package_id"],
-                            "wash_package_name": sess["wash_package_name"],
-                            "wash_type": sess["wash_type"],
-                            "wash_ts_first": sess["first_ts"],
-                            "wash_ts_last": sess["finalize_ts"],
-                            "tip_amount": sess["tip_amount"],
-                        })
-                        finalized_bills.add(bill)
-
-                sess = new_session()
-
-    return rows
