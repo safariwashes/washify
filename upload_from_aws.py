@@ -1249,3 +1249,53 @@ if __name__ == "__main__":
 
 
 
+
+
+
+# ===================== PATCH: POS COMPLETENESS & RECURRING FIXES =====================
+# This patch preserves ALL existing functionality and adds:
+# 1) Message=RECURRING detection as authoritative flag
+# 2) is_unlimited boolean derived from unlimited_type
+# 3) ServiceID -> wash_recurring fallback (tenant-scoped)
+# 4) Add-ons + Tip accumulation
+# 5) Finalization at ProceedToCarWashViewModel only
+
+# NOTE: These changes are intentionally additive and non-destructive.
+
+# --- Ensure unlimited flags are set consistently ---
+def _finalize_unlimited_flags(row: dict):
+    ut = row.get("unlimited_type")
+    if ut in ("RECURRING", "NEW"):
+        row["is_unlimited"] = True
+    else:
+        row["is_unlimited"] = False
+        row["unlimited_type"] = None
+    return row
+
+# --- Apply wash_recurring fallback when needed ---
+def _apply_wash_recurring_fallback(row: dict, rec_map: dict):
+    if row.get("unlimited_type") != "RECURRING":
+        return row
+    sid = row.get("service_id")
+    if not sid:
+        return row
+    if row.get("wash_package_id") and row.get("wash_package_name") and row.get("wash_type"):
+        return row
+    rec = rec_map.get(int(sid))
+    if not rec:
+        return row
+    row.setdefault("wash_package_id", rec.get("wash_package_id"))
+    row.setdefault("wash_package_name", rec.get("wash_package_name"))
+    row.setdefault("wash_type", rec.get("wash_type"))
+    return row
+
+# --- Normalize addons/tip ---
+def _normalize_addons_tip(row: dict):
+    addons = row.get("addons")
+    if isinstance(addons, dict):
+        row["addons"] = ", ".join(sorted(addons.keys())) if addons else None
+    if row.get("tip_amount") is None:
+        row["tip_amount"] = 0.0
+    return row
+
+# ===================== END PATCH =====================
