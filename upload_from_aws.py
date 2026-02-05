@@ -1198,13 +1198,15 @@ def main():
 
         # ---------- Normalize rows for UPSERT_SQL ----------
         REQUIRED_KEYS = [
-            "bill","wash_ts_first","wash_ts_last","license_plate","customer_name",
-            "wash_package_id","wash_package_name","wash_type","payment_type","image_path",
-            "is_unlimited","unlimited_type","addons","tip_amount",
-            "discount_code","discount_amount","tax","total",
-            "location","lane_no","source_file","created_on","created_at","invoice_kind",
-            "tenant_id","location_id",
+             "bill","wash_date","wash_ts_first","wash_ts_last",
+             "license_plate","customer_name",
+             "wash_package_id","wash_package_name","wash_type","payment_type","image_path",
+             "is_unlimited","unlimited_type","addons","tip_amount",
+             "discount_code","discount_amount","tax","total",
+             "location","lane_no","source_file","created_on","created_at","invoice_kind",
+             "tenant_id","location_id",
         ]
+
 
         for r in final_rows:
             # Financial defaults
@@ -1215,8 +1217,13 @@ def main():
 
             # wash_date is REQUIRED (NOT NULL)
             # Ensure wash_ts_first exists so Postgres can generate wash_date
+            # wash_date is REQUIRED for UPSERT (psycopg2 requires key to exist)
             if not r.get("wash_ts_first"):
                 r["wash_ts_first"] = r.get("wash_ts_last") or now_cst()
+
+            # FORCE wash_date for every row
+            r["wash_date"] = r["wash_ts_first"].date()
+
 
             # Ensure all SQL placeholders exist
             for k in REQUIRED_KEYS:
