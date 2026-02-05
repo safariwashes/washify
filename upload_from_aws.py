@@ -654,14 +654,14 @@ def parse_file(
 # ===================== UPSERT INTO POS =====================
 UPSERT_SQL = """
 INSERT INTO pos (
-  bill, wash_ts_first, wash_ts_last, license_plate, customer_name,
+  bill, wash_date, wash_ts_first, wash_ts_last, license_plate, customer_name,
   wash_package_id, wash_package_name, wash_type, payment_type, image_path,
   is_unlimited, unlimited_type, addons, tip_amount,
   discount_code, discount_amount, tax, total,
   location, lane_no, source_file, created_on, created_at, invoice_kind,
   tenant_id, location_id
 ) VALUES (
-  %(bill)s, %(wash_ts_first)s, %(wash_ts_last)s, %(license_plate)s, %(customer_name)s,
+  %(bill)s, %(wash_date)s, %(wash_ts_first)s, %(wash_ts_last)s, %(license_plate)s, %(customer_name)s,
   %(wash_package_id)s, %(wash_package_name)s, %(wash_type)s, %(payment_type)s, %(image_path)s,
   %(is_unlimited)s, %(unlimited_type)s, %(addons)s, %(tip_amount)s,
   %(discount_code)s, %(discount_amount)s, %(tax)s, %(total)s,
@@ -669,6 +669,7 @@ INSERT INTO pos (
   %(tenant_id)s, %(location_id)s
 )
 ON CONFLICT (tenant_id, location_id, bill, wash_date) DO UPDATE SET
+  wash_date = COALESCE(pos.wash_date, EXCLUDED.wash_date),
   wash_ts_first = COALESCE(pos.wash_ts_first, EXCLUDED.wash_ts_first),
   wash_ts_last  = GREATEST(COALESCE(pos.wash_ts_last, EXCLUDED.wash_ts_last), EXCLUDED.wash_ts_last),
 
