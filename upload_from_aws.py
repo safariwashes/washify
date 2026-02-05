@@ -1193,34 +1193,58 @@ def main():
 
         print(f"Parsed {len(all_rows)} rows → {len(final_rows)} after de-dup (by bill)")
 
-        
-        # ---------- Normalize rows for UPSERT_SQL (prevent KeyError) ----------
-        REQUIRED_KEYS = [
-            "bill","wash_ts_first","wash_ts_last","wash_date","license_plate","customer_name",
-            "wash_package_id","wash_package_name","wash_type","payment_type","image_path",
-            "is_unlimited","unlimited_type","addons","tip_amount",
-            "discount_code","discount_amount","tax","total",
-            "location","lane_no","source_file","created_on","created_at","invoice_kind",
-            "tenant_id","location_id",
-        ]
+# ---------- Normalize rows for UPSERT_SQL ----------
+REQUIRED_KEYS = [
+    "bill",
+    "wash_ts_first",
+    "wash_ts_last",
+    "wash_date",
+    "license_plate",
+    "customer_name",
+    "wash_package_id",
+    "wash_package_name",
+    "wash_type",
+    "payment_type",
+    "image_path",
+    "is_unlimited",
+    "unlimited_type",
+    "addons",
+    "tip_amount",
+    "discount_code",
+    "discount_amount",
+    "tax",
+    "total",
+    "location",
+    "lane_no",
+    "source_file",
+    "created_on",
+    "created_at",
+    "invoice_kind",
+    "tenant_id",
+    "location_id",
+]
 
-        for r in final_rows:
-            r.setdefault("discount_code", None)
-            r.setdefault("discount_amount", 0.0)
-            r.setdefault("tax", 0.0)
-            r.setdefault("total", 0.0)
-    	           if not r.get("wash_date"):
-                   if r.get("wash_ts_first"):
-                   r["wash_date"] = r["wash_ts_first"].date()
-                   elif r.get("wash_ts_last"):
-                   r["wash_date"] = r["wash_ts_last"].date()
-                   else:
-                   r["wash_date"] = now_cst_date()
+for r in final_rows:
+    # financial defaults
+    r.setdefault("discount_code", None)
+    r.setdefault("discount_amount", 0.0)
+    r.setdefault("tax", 0.0)
+    r.setdefault("total", 0.0)
 
-            for k in REQUIRED_KEYS:
-                r.setdefault(k, None)
-        # ---------- END normalize ----------
+    # wash_date is REQUIRED by DB (NOT NULL)
+    if not r.get("wash_date"):
+        if r.get("wash_ts_first"):
+            r["wash_date"] = r["wash_ts_first"].date()
+        elif r.get("wash_ts_last"):
+            r["wash_date"] = r["wash_ts_last"].date()
+        else:
+            r["wash_date"] = now_cst_date()
 
+    # ensure all keys required by SQL exist
+    for k in REQUIRED_KEYS:
+        r.setdefault(k, None)
+
+# ---------- END normalize ----------
 
         inserted = batch_upsert(conn, final_rows)
         print(f"✅ Upserted {inserted} rows into pos")
