@@ -855,6 +855,24 @@ def seed_rules_if_empty(conn, tenant_id: str):
                     ),
                 )
         conn.commit()
+def parse_ts(line: str) -> tuple[Optional[datetime], str]:
+    """
+    Parse timestamp prefix from kiosk log lines.
+    Returns (timestamp | None, remaining_content).
+    """
+    m = TS_RE.match(line)
+    if not m:
+        return None, line
+
+    try:
+        ts = datetime.strptime(
+            m.group(1),
+            "%m/%d/%Y %I:%M:%S %p"
+        )
+    except Exception:
+        return None, line
+
+    return ts, line[m.end():]
 
 def find_last_bill_index(lines: list, last_bill: int) -> int | None:
     """
