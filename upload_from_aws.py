@@ -706,7 +706,7 @@ if sess["unlimited_type"] == "NEW":
             })
 
             sess = None  # reset for next transaction
-
+    print("DEBUG: returning rows")
     return rows
 # ===================== UPSERT INTO POS =====================
 UPSERT_SQL = """
