@@ -549,21 +549,16 @@ def parse_file(
             "invoice": None,
             "wash_ts_first": None,
             "wash_ts_last": None,
-
             "wash_package_id": None,
             "wash_package_name": None,
             "wash_type": None,
-
             "service_id": None,
-            "unlimited_type": None,  # NEW | RECURRING
-
+            "unlimited_type": None,
             "addons": set(),
-
             "license_plate": None,
             "customer_name": None,
             "payment_type": None,
             "image_path": None,
-
             "discount_code": None,
             "discount_amount": 0.0,
             "tax": 0.0,
@@ -586,19 +581,16 @@ def parse_file(
         ):
             sess = new_session()
             sess["wash_ts_first"] = ts
-
-            if "Message=RECURRING" in content:
-                sess["unlimited_type"] = "RECURRING"
-            else:
-                sess["unlimited_type"] = "NEW"
-
+            sess["unlimited_type"] = (
+                "RECURRING" if "Message=RECURRING" in content else "NEW"
+            )
             continue
 
         if not sess:
             continue
 
         # =========================================================
-        # Common field capture (safe anywhere inside session)
+        # Common field capture
         # =========================================================
         m = LICENSE_PLATE_RE.search(content)
         if m:
@@ -629,53 +621,52 @@ def parse_file(
         if m:
             sess["total"] = float(m.group(1))
 
-# =========================================================
-# NEW CUSTOMER → Wash Package (NO ServiceID)
-# =========================================================
-if sess["unlimited_type"] == "NEW":
-    m = WASH_PKG_RE.search(content)
-    if m:
-        pkg_id = int(m.group(1))
-        pkg_name = normalize_ws_name(m.group(2))
+        # =========================================================
+        # NEW CUSTOMER → Wash Package
+        # =========================================================
+        if sess["unlimited_type"] == "NEW":   # ⬅️ INDENTED
+            m = WASH_PKG_RE.search(content)
+            if m:
+                pkg_id = int(m.group(1))
+                pkg_name = normalize_ws_name(m.group(2))
 
-        # 1️⃣ First try wash_recurring (authoritative)
-        rec = None
-        for r in wash_recurring_map.values():
-            if r["wash_package_name"].lower() == pkg_name.lower():
-                rec = r
-                break
+                rec = next(
+                    (
+                        r for r in wash_recurring_map.values()
+                        if r["wash_package_name"].lower() == pkg_name.lower()
+                    ),
+                    None
+                )
 
-        if rec:
-            if rec["item_kind"] == "WASH":
-                sess["wash_package_id"] = rec["wash_package_id"]
-                sess["wash_package_name"] = rec["wash_package_name"]
-                sess["wash_type"] = rec["wash_type"]
-            elif rec["item_kind"] == "ADDON":
-                sess["addons"].add(rec["addon_name"])
-
-        else:
-            # 2️⃣ Fallback to existing rule logic (safe)
-            mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
-            if mapped:
-                sess["wash_package_id"] = pkg_id
-                sess["wash_package_name"] = pkg_name
-                sess["wash_type"] = mapped
+                if rec:
+                    if rec["item_kind"] == "WASH":
+                        sess["wash_package_id"] = rec["wash_package_id"]
+                        sess["wash_package_name"] = rec["wash_package_name"]
+                        sess["wash_type"] = rec["wash_type"]
+                    elif rec["item_kind"] == "ADDON":
+                        sess["addons"].add(rec["addon_name"])
+                else:
+                    mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
+                    if mapped:
+                        sess["wash_package_id"] = pkg_id
+                        sess["wash_package_name"] = pkg_name
+                        sess["wash_type"] = mapped
 
         # =========================================================
-        # RECURRING → ServiceID → wash_recurring
+        # RECURRING → ServiceID
         # =========================================================
-        if sess["unlimited_type"] == "RECURRING":
+        if sess["unlimited_type"] == "RECURRING":   # ⬅️ INDENTED
             m = SERVICE_ID_RE.search(content)
             if m:
                 sess["service_id"] = int(m.group(1))
 
         # =========================================================
-        # END OF TRANSACTION (OpenGate)
+        # END OF TRANSACTION
         # =========================================================
         if (
             "ClassName=ProceedToCarWashViewModel" in content
             and "MethodName=OpenGate" in content
-        ):
+        ):   # ⬅️ INDENTED
             sess["wash_ts_last"] = ts
 
             rows.append({
@@ -689,9 +680,9 @@ if sess["unlimited_type"] == "NEW":
                 "wash_type": sess["wash_type"],
                 "payment_type": sess["payment_type"],
                 "image_path": sess["image_path"],
-                "is_unlimited": sess["unlimited_type"] in ("NEW", "RECURRING"),
+                "is_unlimited": True,
                 "unlimited_type": sess["unlimited_type"],
-                "addons": ", ".join(sorted(sess["addons"])) if sess["addons"] else None,
+                "addons": ", ".join(sorted(sess["addons"])) or None,
                 "tip_amount": sess["tip_amount"],
                 "discount_code": sess["discount_code"],
                 "discount_amount": sess["discount_amount"],
@@ -705,7 +696,8 @@ if sess["unlimited_type"] == "NEW":
                 "invoice_kind": "WASH",
             })
 
-            sess = None  # reset for next transaction
+            sess = None
+
     print("DEBUG: returning rows")
     return rows
 # ===================== UPSERT INTO POS =====================
