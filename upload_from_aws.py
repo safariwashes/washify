@@ -16,6 +16,38 @@ from botocore.config import Config
 # timezone (Python 3.9+ built-in)
 from zoneinfo import ZoneInfo
 
+# ===================== FINANCIAL REGEX =====================
+
+TS_RE = re.compile(
+    r"^\s*(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)\s*,\s*"
+)
+
+TAX_RE = re.compile(
+    r"Tax[:\s]+\$?([0-9]+(?:\.[0-9]{1,2})?)\b",
+    re.IGNORECASE
+)
+
+TOTAL_RE = re.compile(
+    r"Total[:\s]+\$?([0-9]+(?:\.[0-9]{1,2})?)\b",
+    re.IGNORECASE
+)
+
+DISCOUNT_BOTH_RE = re.compile(
+    r"Discount[:\s]+([A-Za-z0-9._-]+)\s+\$?([0-9]+(?:\.[0-9]{1,2})?)",
+    re.IGNORECASE
+)
+
+DISCOUNT_CODE_RE = re.compile(
+    r"Discount(?:\s+Code)?[:\s]+([A-Za-z][A-Za-z0-9._-]*)",
+    re.IGNORECASE
+)
+
+DISCOUNT_AMOUNT_RE = re.compile(
+    r"Discount(?:\s+Amount)?[:\s]+\$?([0-9]+(?:\.[0-9]{1,2})?)",
+    re.IGNORECASE
+)
+
+
 # Optional .env support
 try:
     from dotenv import load_dotenv
@@ -494,23 +526,6 @@ def map_wash_type_from_rules(
                 return r.get("wash_type")
 
     return None
-
-# ===================== PARSING REGEX =====================
-DISCOUNT_BOTH_RE = re.compile(
-    r"Discount[:\s]+([A-Za-z0-9._-]+)\s+\$?([0-9]+(?:\.[0-9]{1,2})?)",
-    re.IGNORECASE
-)
-
-TIP_AMOUNT_RE = re.compile(
-    r"\bTip\s*\$?\s*([0-9]+(?:\.[0-9]{1,2})?)\b",
-    re.IGNORECASE
-)
-
-OPEN_GATE_RE = re.compile(
-    r"ClassName=ProceedToCarWashViewModel.*MethodName=OpenGate",
-    re.IGNORECASE
-)
-
 
 def parse_file(
     path: Path,
