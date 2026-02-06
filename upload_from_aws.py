@@ -495,6 +495,23 @@ def map_wash_type_from_rules(
 
     return None
 
+# ===================== PARSING REGEX =====================
+DISCOUNT_BOTH_RE = re.compile(
+    r"Discount[:\s]+([A-Za-z0-9._-]+)\s+\$?([0-9]+(?:\.[0-9]{1,2})?)",
+    re.IGNORECASE
+)
+
+TIP_AMOUNT_RE = re.compile(
+    r"\bTip\s*\$?\s*([0-9]+(?:\.[0-9]{1,2})?)\b",
+    re.IGNORECASE
+)
+
+OPEN_GATE_RE = re.compile(
+    r"ClassName=ProceedToCarWashViewModel.*MethodName=OpenGate",
+    re.IGNORECASE
+)
+
+
 def parse_file(
     path: Path,
     wash_type_rules: list,
