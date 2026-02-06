@@ -405,156 +405,62 @@ def load_wash_recurring_map(conn, tenant_id: str) -> Dict[int, Dict[str, Any]]:
 
 
 # ===================== PARSING REGEX =====================
-TS_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)\s*,\s*")
+TS_RE = re.compile(
+    r"^\s*(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)\s*,\s*"
+)
 
-INVOICE_INLINE_PAY_RE = re.compile(r"InvoiceID\s+(\d+)\s+Payment Type\s+([A-Za-z]+)", re.IGNORECASE)
-PROCEED_INVOICE_RE = re.compile(r"ProceedToCarWashViewModel.*?InvoiceID\s+(\d+)", re.IGNORECASE)
-DO_TXN_RE = re.compile(r"DoTransactionAfterDispatcher\s+(\d+)", re.IGNORECASE)
+PROCEED_INVOICE_RE = re.compile(
+    r"ProceedToCarWashViewModel.*?InvoiceID\s+(\d+)", re.IGNORECASE
+)
+
+RETURN_INVOICE_RE = re.compile(
+    r"MethodName=ReturnToMainScreen.*?InvoiceID\s+(\d+)", re.IGNORECASE
+)
+
 INVOICE_ANY_RE = re.compile(r"InvoiceID\s+(\d+)", re.IGNORECASE)
-INVOICE_FROM_AWS_RE = re.compile(r"InvoiceId\s+(\d+)", re.IGNORECASE)
-
-INVOICE_SEARCH_RES = [
-    INVOICE_INLINE_PAY_RE,
-    DO_TXN_RE,
-    PROCEED_INVOICE_RE,
-    INVOICE_ANY_RE,
-    INVOICE_FROM_AWS_RE,
-]
-
-WASH_PKG_RE = re.compile(r"Wash Package\s+(\d+)\s+with Name\s+(.+)$", re.IGNORECASE)
 PAYMENT_TYPE_RE = re.compile(r"Payment Type\s+([A-Za-z]+)", re.IGNORECASE)
+WASH_PKG_RE = re.compile(r"Wash Package\s+(\d+)\s+with Name\s+(.+)$", re.IGNORECASE)
 AWS_FILE_RE = re.compile(r"Aws File Name\s+(.+)$", re.IGNORECASE)
-LICENSE_PLATE_RE = re.compile(r"(?:License Plate|LICENSE PLATE)\s+([A-Z0-9]+)", re.IGNORECASE)
+LICENSE_PLATE_RE = re.compile(r"License Plate\s+([A-Z0-9]+)", re.IGNORECASE)
 CUSTOMER_NAME_RE = re.compile(r"Customer Name\s+([^,]+)", re.IGNORECASE)
-
-UNLIMITED_NEW_RE   = re.compile(r"NEW CUSTOMER\s*->", re.IGNORECASE)
-UNLIMITED_RECUR_RE = re.compile(r"RECURRING\s*->", re.IGNORECASE)
-
-# ===================== NEW: KEY INDICATOR FOR RECURRING (USER REQUEST) =====================
-MESSAGE_RECURRING_RE = re.compile(r"Message\s*=\s*RECURRING\b", re.IGNORECASE)
-
-# ===================== NEW: ServiceID extraction for recurring unlimited =====================
 SERVICE_ID_RE = re.compile(r"ServiceID\s*(\d+)", re.IGNORECASE)
-
-TIP_AMOUNT_RE = re.compile(r"\bTip\s*\$?\s*([0-9]+(?:\.[0-9]{1,2})?)\b", re.IGNORECASE)
-
-DISCOUNT_BOTH_RE   = re.compile(r"Discount[:\s]+([A-Za-z0-9._-]+)\s+\$?([0-9]+(?:\.[0-9]{1,2})?)", re.IGNORECASE)
-DISCOUNT_CODE_RE   = re.compile(r"Discount(?:\s+Code)?[:\s]+([A-Za-z][A-Za-z0-9._-]*)", re.IGNORECASE)
-DISCOUNT_AMOUNT_RE = re.compile(r"Discount(?:\s+Amount)?[:\s]+\$?([0-9]+(?:\.[0-9]{1,2})?)", re.IGNORECASE)
-
-TAX_RE   = re.compile(r"Tax[:\s]+\$?([0-9]+(?:\.[0-9]{1,2})?)\b", re.IGNORECASE)
-TOTAL_RE = re.compile(r"Total[:\s]+\$?([0-9]+(?:\.[0-9]{1,2})?)\b", re.IGNORECASE)
-
-
-def parse_ts(line: str) -> Tuple[Optional[datetime], str]:
-    m = TS_RE.match(line)
-    if not m:
-        return None, line
-    ts = datetime.strptime(m.group(1), "%m/%d/%Y %I:%M:%S %p")
-    return ts, line[m.end():]
-
-
-def find_last_bill_index(lines: List[str], last_bill: Optional[int]) -> Optional[int]:
-    if last_bill is None:
-        return None
-    target = str(last_bill)
-    for idx in range(len(lines) - 1, -1, -1):
-        raw = lines[idx].strip()
-        if not raw:
-            continue
-        _, content = parse_ts(raw)
-        for regex in INVOICE_SEARCH_RES:
-            mm = regex.search(content)
-            if mm and mm.group(1) == target:
-                return idx
-    return None
-
-
-# ===================== WASH TYPE RESOLUTION (DB RULES) =====================
-def normalize_ws_name(name: Optional[str]) -> Optional[str]:
-    if not name:
-        return None
-    s = str(name).strip()
-    if not s:
-        return None
-    for stop in ["VehicleID", "ServiceID", "ServiceName", "VehicleId", "ServiceId"]:
-        if stop in s:
-            s = s.split(stop, 1)[0].strip()
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s or None
-
-
-def map_wash_type_from_rules(pkg_name: Optional[str], rules: List[Dict[str, Any]]) -> Optional[str]:
-    if not pkg_name:
-        return None
-
-    name = normalize_ws_name(pkg_name)
-    low = name.lower()
-
-    for r in rules:
-        mtype = r["match_type"]
-        pat = r["pattern"]
-        if mtype == "contains":
-            if pat.lower() in low:
-                return r["wash_type"]
-        elif mtype == "exact":
-            if pat.lower() == low:
-                return r["wash_type"]
-        elif mtype == "regex":
-            rx = r.get("_re")
-            if rx and rx.search(name):
-                return r["wash_type"]
-
-    return None
+MESSAGE_RECURRING_RE = re.compile(r"Message\s*=\s*RECURRING", re.IGNORECASE)
+TIP_AMOUNT_RE = re.compile(r"\bTip\s*\$?\s*([0-9]+(?:\.[0-9]{1,2})?)", re.IGNORECASE)
 
 
 # ===================== PARSER =====================
 def parse_file(
     path: Path,
-    wash_type_rules: List[Dict[str, Any]],
-    start_index: int = 0,
-    preloaded_lines: Optional[List[str]] = None,
-    location_label: Optional[str] = None,
-    lane_no: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+    wash_type_rules: list,
+    start_index: int,
+    preloaded_lines: list,
+    location_label: str,
+    lane_no: int,
+) -> list:
 
-    sessions: List[Dict[str, Any]] = []
-    sess: Optional[Dict[str, Any]] = None
+    rows = []
+    sess = None
 
     def new_session():
         return {
             "invoice": None,
-            "txn_start_ts": None,
-            "finalize_ts": None,
             "first_ts": None,
             "last_ts": None,
-
-            # 🔁 pending (may change)
-            "pending_wash_package_id": None,
-            "pending_wash_package_name": None,
-            "pending_wash_type": None,
-
-            # 🔒 final (locked at proceed)
             "wash_package_id": None,
             "wash_package_name": None,
             "wash_type": None,
-            "final_wash_locked": False,
-
+            "payment_type": None,
+            "license_plate": None,
+            "customer_name": None,
+            "image_path": None,
             "service_id": None,
             "unlimited_type": None,
-            "addon_map": {},
+            "addons": {},
             "tip_amount": 0.0,
+            "wash_locked": False,
         }
 
-    def end_session():
-        nonlocal sess
-        if sess:
-            sessions.append(sess)
-        sess = None
-
-    lines = preloaded_lines if preloaded_lines is not None else path.read_text(errors="ignore").splitlines()
-
-    for raw in lines[start_index:]:
+    for raw in preloaded_lines[start_index:]:
         ts, content = parse_ts(raw.strip())
         if not content:
             continue
@@ -566,10 +472,10 @@ def parse_file(
             sess["first_ts"] = sess["first_ts"] or ts
             sess["last_ts"] = ts
 
-        for rx in INVOICE_SEARCH_RES:
-            m = rx.search(content)
-            if m and m.group(1) != "0":
-                sess["invoice"] = m.group(1)
+        # invoice (any form)
+        m = INVOICE_ANY_RE.search(content)
+        if m:
+            sess["invoice"] = int(m.group(1))
 
         if MESSAGE_RECURRING_RE.search(content):
             sess["unlimited_type"] = "RECURRING"
@@ -578,52 +484,64 @@ def parse_file(
         if m:
             sess["service_id"] = int(m.group(1))
 
-        # 🟡 Capture wash as *pending*
-        m = WASH_PKG_RE.search(content)
+        m = PAYMENT_TYPE_RE.search(content)
         if m:
-            pkg_id = int(m.group(1))
-            pkg_name = normalize_ws_name(m.group(2))
-            mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
+            sess["payment_type"] = m.group(1)
 
-            if mapped:
-                sess["pending_wash_package_id"] = pkg_id
-                sess["pending_wash_package_name"] = pkg_name
-                sess["pending_wash_type"] = mapped
+        m = WASH_PKG_RE.search(content)
+        if m and not sess["wash_locked"]:
+            sess["wash_package_id"] = int(m.group(1))
+            sess["wash_package_name"] = normalize_ws_name(m.group(2))
+            sess["wash_type"] = map_wash_type_from_rules(
+                sess["wash_package_name"], wash_type_rules
+            )
 
-        # ✅ FINALIZATION POINT
-        if "MethodName=ReturnToMainScreen" in content and sess.get("invoice"):
-            finalize_pos(sess)
+        m = AWS_FILE_RE.search(content)
+        if m:
+            sess["image_path"] = normalize_image_path(m.group(1), sess["invoice"])
 
+        m = LICENSE_PLATE_RE.search(content)
+        if m:
+            sess["license_plate"] = m.group(1)
 
-            # 1️⃣ Lock last chosen wash
-            if sess["pending_wash_type"]:
-                sess["wash_package_id"] = sess["pending_wash_package_id"]
-                sess["wash_package_name"] = sess["pending_wash_package_name"]
-                sess["wash_type"] = sess["pending_wash_type"]
+        m = CUSTOMER_NAME_RE.search(content)
+        if m:
+            sess["customer_name"] = m.group(1).strip()
 
-            sess["final_wash_locked"] = True
-            end_session()
+        m = TIP_AMOUNT_RE.search(content)
+        if m:
+            sess["tip_amount"] = float(m.group(1))
 
-    rows: List[Dict[str, Any]] = []
-    for s in sessions:
-        if not s.get("invoice") or not s.get("finalize_ts"):
-            continue
+        # 🔒 LOCK wash at proceed
+        if PROCEED_INVOICE_RE.search(content):
+            sess["wash_locked"] = True
 
-        rows.append({
-            "bill": int(s["invoice"]),
-            "wash_ts_first": s["txn_start_ts"],
-            "wash_ts_last": s["finalize_ts"],
-            "wash_package_id": s.get("wash_package_id"),
-            "wash_package_name": s.get("wash_package_name"),
-            "wash_type": s.get("wash_type"),
-            "location": location_label,
-            "lane_no": lane_no,
-            "source_file": path.name,
-            "created_on": now_cst_date(),
-            "created_at": now_cst_time(),
-            "invoice_kind": "WASH",
-            "service_id": s.get("service_id"),
-        })
+        # ✅ FINALIZE ONLY HERE
+        if RETURN_INVOICE_RE.search(content) and sess.get("invoice"):
+            rows.append({
+                "bill": sess["invoice"],
+                "wash_ts_first": sess["first_ts"],
+                "wash_ts_last": sess["last_ts"],
+                "wash_package_id": sess["wash_package_id"],
+                "wash_package_name": sess["wash_package_name"],
+                "wash_type": sess["wash_type"],
+                "payment_type": sess["payment_type"],
+                "license_plate": sess["license_plate"],
+                "customer_name": sess["customer_name"],
+                "image_path": sess["image_path"],
+                "service_id": sess["service_id"],
+                "unlimited_type": sess["unlimited_type"],
+                "is_unlimited": sess["unlimited_type"] == "RECURRING",
+                "addons": ", ".join(sorted(sess["addons"].keys())) if sess["addons"] else None,
+                "tip_amount": sess["tip_amount"],
+                "location": location_label,
+                "lane_no": lane_no,
+                "source_file": path.name,
+                "created_on": now_cst_date(),
+                "created_at": now_cst_time(),
+                "invoice_kind": "WASH",
+            })
+            sess = None
 
     return rows
 
@@ -1238,12 +1156,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
 
 # ===================== PATCH: POS COMPLETENESS & RECURRING FIXES =====================
 # This patch preserves ALL existing functionality and adds:
