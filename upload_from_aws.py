@@ -526,29 +526,23 @@ def map_wash_type_from_rules(
                 return r.get("wash_type")
 
     return None
-
+# ===================== PARSE_FILE =====================
 def parse_file(
     path: Path,
-    wash_type_rules: list,
+    wash_type_rules: List[Dict[str, Any]],
+    wash_recurring_map: Dict[int, Dict[str, Any]],
     start_index: int = 0,
-    preloaded_lines: list | None = None,
-    location_label: str | None = None,
-    lane_no: int | None = None,
-) -> list[dict]:
-    """
-    Parse kiosk Transaction file.
-    Each transaction is finalized ONLY on:
-      MethodName=OpenGate
+    preloaded_lines: Optional[List[str]] = None,
+    location_label: Optional[str] = None,
+    lane_no: Optional[int] = None,
+) -> List[Dict[str, Any]]:
 
-    One OpenGate = one POS row.
-    """
+    rows: List[Dict[str, Any]] = []
+    sess: Optional[Dict[str, Any]] = None
 
-    lines = preloaded_lines if preloaded_lines is not None else \
-        path.read_text(errors="ignore").splitlines()
-
-    rows: list[dict] = []
-
-    sess = None
+    lines = preloaded_lines if preloaded_lines is not None else path.read_text(
+        errors="ignore"
+    ).splitlines()
 
     def new_session():
         return {
@@ -556,121 +550,77 @@ def parse_file(
             "wash_ts_first": None,
             "wash_ts_last": None,
 
-            "license_plate": None,
-            "customer_name": None,
-            "payment_type": None,
-
             "wash_package_id": None,
             "wash_package_name": None,
             "wash_type": None,
 
             "service_id": None,
-            "is_unlimited": False,
-            "unlimited_type": None,
+            "unlimited_type": None,  # NEW | RECURRING
 
             "addons": set(),
-            "tip_amount": 0.0,
+
+            "license_plate": None,
+            "customer_name": None,
+            "payment_type": None,
+            "image_path": None,
 
             "discount_code": None,
             "discount_amount": 0.0,
             "tax": 0.0,
             "total": 0.0,
-
-            "image_path": None,
+            "tip_amount": 0.0,
         }
 
     for raw in lines[start_index:]:
-        raw = raw.strip()
-        if not raw:
+        ts, content = parse_ts(raw.strip())
+        if not content or not ts:
             continue
 
-        ts, content = parse_ts(raw)
-
-        # start session if needed
-        if sess is None:
+        # =========================================================
+        # START OF TRANSACTION (NEW or RECURRING)
+        # =========================================================
+        if (
+            "ClassName=RFID Unlimited" in content
+            and "MethodName=BindCustomerVehicleInformation" in content
+            and ("Message=NEW CUSTOMER" in content or "Message=RECURRING" in content)
+        ):
             sess = new_session()
+            sess["wash_ts_first"] = ts
 
-        if ts:
-            sess["wash_ts_first"] = sess["wash_ts_first"] or ts
-            sess["wash_ts_last"] = ts
+            if "Message=RECURRING" in content:
+                sess["unlimited_type"] = "RECURRING"
+            else:
+                sess["unlimited_type"] = "NEW"
 
-        # -----------------------
-        # Invoice
-        # -----------------------
-        m = INVOICE_ANY_RE.search(content)
-        if m:
-            sess["invoice"] = int(m.group(1))
+            continue
 
-        # -----------------------
-        # Payment type
-        # -----------------------
-        m = PAYMENT_TYPE_RE.search(content)
-        if m:
-            sess["payment_type"] = m.group(1)
+        if not sess:
+            continue
 
-        # -----------------------
-        # License plate
-        # -----------------------
+        # =========================================================
+        # Common field capture (safe anywhere inside session)
+        # =========================================================
         m = LICENSE_PLATE_RE.search(content)
         if m:
-            sess["license_plate"] = m.group(1).upper()
+            sess["license_plate"] = m.group(1)
 
-        # -----------------------
-        # Customer name
-        # -----------------------
         m = CUSTOMER_NAME_RE.search(content)
         if m:
             sess["customer_name"] = m.group(1).strip()
 
-        # -----------------------
-        # Wash package
-        # -----------------------
-        m = WASH_PKG_RE.search(content)
+        m = PAYMENT_TYPE_RE.search(content)
         if m:
-            pkg_id = int(m.group(1))
-            pkg_name = normalize_ws_name(m.group(2))
-            sess["wash_package_id"] = pkg_id
-            sess["wash_package_name"] = pkg_name
-            sess["wash_type"] = map_wash_type_from_rules(pkg_name, wash_type_rules)
+            sess["payment_type"] = m.group(1)
 
-        # -----------------------
-        # ServiceID (Unlimited)
-        # -----------------------
-        m = SERVICE_ID_RE.search(content)
+        m = AWS_FILE_RE.search(content)
         if m:
-            sess["service_id"] = int(m.group(1))
+            sess["image_path"] = normalize_image_path(m.group(1), sess.get("invoice"))
 
-        # -----------------------
-        # Unlimited flag
-        # -----------------------
-        if MESSAGE_RECURRING_RE.search(content):
-            sess["is_unlimited"] = True
-            sess["unlimited_type"] = "RECURRING"
-
-        # -----------------------
-        # Add-ons
-        # -----------------------
-        if "AddOn" in content:
-            sess["addons"].add(content.strip())
-
-        # -----------------------
-        # Tip
-        # -----------------------
-        m = TIP_AMOUNT_RE.search(content)
-        if m:
-            sess["tip_amount"] = float(m.group(1))
-
-        # -----------------------
-        # Discount
-        # -----------------------
         m = DISCOUNT_BOTH_RE.search(content)
         if m:
             sess["discount_code"] = m.group(1)
             sess["discount_amount"] = float(m.group(2))
 
-        # -----------------------
-        # Tax / Total
-        # -----------------------
         m = TAX_RE.search(content)
         if m:
             sess["tax"] = float(m.group(1))
@@ -679,47 +629,79 @@ def parse_file(
         if m:
             sess["total"] = float(m.group(1))
 
-        # -----------------------
-        # Image
-        # -----------------------
-        m = AWS_FILE_RE.search(content)
-        if m:
-            sess["image_path"] = normalize_image_path(m.group(1))
+# =========================================================
+# NEW CUSTOMER → Wash Package (NO ServiceID)
+# =========================================================
+if sess["unlimited_type"] == "NEW":
+    m = WASH_PKG_RE.search(content)
+    if m:
+        pkg_id = int(m.group(1))
+        pkg_name = normalize_ws_name(m.group(2))
 
-        # ============================================================
-        # ✅ FINALIZE TRANSACTION — THIS IS THE ONLY EXIT
-        # ============================================================
-        if "MethodName=OpenGate" in content and sess.get("invoice"):
+        # 1️⃣ First try wash_recurring (authoritative)
+        rec = None
+        for r in wash_recurring_map.values():
+            if r["wash_package_name"].lower() == pkg_name.lower():
+                rec = r
+                break
+
+        if rec:
+            if rec["item_kind"] == "WASH":
+                sess["wash_package_id"] = rec["wash_package_id"]
+                sess["wash_package_name"] = rec["wash_package_name"]
+                sess["wash_type"] = rec["wash_type"]
+            elif rec["item_kind"] == "ADDON":
+                sess["addons"].add(rec["addon_name"])
+
+        else:
+            # 2️⃣ Fallback to existing rule logic (safe)
+            mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
+            if mapped:
+                sess["wash_package_id"] = pkg_id
+                sess["wash_package_name"] = pkg_name
+                sess["wash_type"] = mapped
+
+        # =========================================================
+        # RECURRING → ServiceID → wash_recurring
+        # =========================================================
+        if sess["unlimited_type"] == "RECURRING":
+            m = SERVICE_ID_RE.search(content)
+            if m:
+                sess["service_id"] = int(m.group(1))
+
+        # =========================================================
+        # END OF TRANSACTION (OpenGate)
+        # =========================================================
+        if (
+            "ClassName=ProceedToCarWashViewModel" in content
+            and "MethodName=OpenGate" in content
+        ):
+            sess["wash_ts_last"] = ts
+
             rows.append({
-                "bill": sess["invoice"],
+                "bill": sess.get("invoice"),
                 "wash_ts_first": sess["wash_ts_first"],
                 "wash_ts_last": sess["wash_ts_last"],
-
                 "license_plate": sess["license_plate"],
                 "customer_name": sess["customer_name"],
-                "payment_type": sess["payment_type"],
-
                 "wash_package_id": sess["wash_package_id"],
                 "wash_package_name": sess["wash_package_name"],
                 "wash_type": sess["wash_type"],
-
-                "service_id": sess["service_id"],
-                "is_unlimited": sess["is_unlimited"],
+                "payment_type": sess["payment_type"],
+                "image_path": sess["image_path"],
+                "is_unlimited": sess["unlimited_type"] in ("NEW", "RECURRING"),
                 "unlimited_type": sess["unlimited_type"],
-
                 "addons": ", ".join(sorted(sess["addons"])) if sess["addons"] else None,
                 "tip_amount": sess["tip_amount"],
-
                 "discount_code": sess["discount_code"],
                 "discount_amount": sess["discount_amount"],
                 "tax": sess["tax"],
                 "total": sess["total"],
-
-                "image_path": sess["image_path"],
-
                 "location": location_label,
                 "lane_no": lane_no,
                 "source_file": path.name,
+                "created_on": now_cst_date(),
+                "created_at": now_cst_time(),
                 "invoice_kind": "WASH",
             })
 
@@ -1245,14 +1227,19 @@ def main():
                 print("No existing rows today for this tenant/location; parsing provided content from start.")
 
             parse_path = local_path or (Path(tempfile.gettempdir()) / filename)
+            if tenant_id not in recurring_cache:
+                recurring_cache[tenant_id] = load_wash_recurring_map(conn, tenant_id)
+
             parsed_rows = parse_file(
                 parse_path,
                 wash_type_rules=wash_type_rules,
+                wash_recurring_map=recurring_cache[tenant_id], 
                 start_index=start_idx,
                 preloaded_lines=lines,
                 location_label=location_label,
                 lane_no=lane_no,
             )
+
 
             for r in parsed_rows:
                 r["tenant_id"] = tenant_id
