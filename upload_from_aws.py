@@ -591,8 +591,9 @@ def parse_file(
                 sess["pending_wash_type"] = mapped
 
         # ✅ FINALIZATION POINT
-        if "ProceedToCarWashViewModel" in content and sess.get("invoice"):
-            sess["finalize_ts"] = ts
+        if "MethodName=ReturnToMainScreen" in content and sess.get("invoice"):
+            finalize_pos(sess)
+
 
             # 1️⃣ Lock last chosen wash
             if sess["pending_wash_type"]:
