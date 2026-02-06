@@ -856,6 +856,30 @@ def seed_rules_if_empty(conn, tenant_id: str):
                 )
         conn.commit()
 
+def find_last_bill_index(lines: list, last_bill: int) -> int | None:
+    """
+    Find the last occurrence of a given bill number in the kiosk log lines.
+    Used to safely resume parsing with a buffer.
+    """
+    if not last_bill:
+        return None
+
+    target = str(last_bill)
+
+    for idx in range(len(lines) - 1, -1, -1):
+        raw = lines[idx].strip()
+        if not raw:
+            continue
+
+        _, content = parse_ts(raw)
+
+        if not content:
+            continue
+
+        if f"InvoiceID {target}" in content or f"InvoiceId {target}" in content:
+            return idx
+
+    return None
 
 # ===================== MAIN =====================
 def main():
