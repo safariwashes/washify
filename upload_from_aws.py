@@ -429,6 +429,33 @@ TIP_AMOUNT_RE = re.compile(r"\bTip\s*\$?\s*([0-9]+(?:\.[0-9]{1,2})?)", re.IGNORE
 
 
 # ===================== PARSER =====================
+def normalize_ws_name(name: Optional[str]) -> Optional[str]:
+    """
+    Normalize Washify wash package names so they are consistent
+    and safe for rule matching.
+    """
+    if not name:
+        return None
+
+    s = str(name).strip()
+    if not s:
+        return None
+
+    # Strip known noisy suffixes Washify appends
+    for token in (
+        "VehicleID",
+        "VehicleId",
+        "ServiceID",
+        "ServiceId",
+        "ServiceName",
+    ):
+        if token in s:
+            s = s.split(token, 1)[0].strip()
+
+    # Collapse extra whitespace
+    s = re.sub(r"\s{2,}", " ", s).strip()
+
+    return s or None
 def parse_file(
     path: Path,
     wash_type_rules: list,
