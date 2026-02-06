@@ -456,6 +456,45 @@ def normalize_ws_name(name: Optional[str]) -> Optional[str]:
     s = re.sub(r"\s{2,}", " ", s).strip()
 
     return s or None
+def map_wash_type_from_rules(
+    pkg_name: Optional[str],
+    rules: List[Dict[str, Any]],
+) -> Optional[str]:
+    """
+    Resolve wash_type using DB-driven wash_type_rules.
+    Priority order is already enforced by SQL ORDER BY.
+    """
+    if not pkg_name:
+        return None
+
+    name = normalize_ws_name(pkg_name)
+    if not name:
+        return None
+
+    low = name.lower()
+
+    for r in rules:
+        match_type = r.get("match_type")
+        pattern = (r.get("pattern") or "").strip()
+
+        if not pattern:
+            continue
+
+        if match_type == "contains":
+            if pattern.lower() in low:
+                return r.get("wash_type")
+
+        elif match_type == "exact":
+            if pattern.lower() == low:
+                return r.get("wash_type")
+
+        elif match_type == "regex":
+            rx = r.get("_re")
+            if rx and rx.search(name):
+                return r.get("wash_type")
+
+    return None
+
 def parse_file(
     path: Path,
     wash_type_rules: list,
