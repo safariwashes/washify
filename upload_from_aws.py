@@ -694,7 +694,7 @@ if (
         sess = None
         continue
 
-            rows.append({
+    rows.append({
                 "bill": sess.get("invoice"),
                 "wash_ts_first": sess["wash_ts_first"],
                 "wash_ts_last": sess["wash_ts_last"],
@@ -721,7 +721,7 @@ if (
                 "invoice_kind": "WASH",
             })
 
-            sess = None
+    sess = None
 
     print("DEBUG: returning rows")
     return rows
