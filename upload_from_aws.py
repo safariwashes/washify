@@ -416,7 +416,7 @@ def load_wash_recurring_map(conn, tenant_id: str) -> Dict[int, Dict[str, Any]]:
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT wash_package_id, wash_package_name, wash_type
+            SELECT wash_package_id, wash_package_name, wash_type, item_kind, addon_name
             FROM wash_recurring
             WHERE tenant_id = %s
             """,
