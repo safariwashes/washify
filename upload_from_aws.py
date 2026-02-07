@@ -678,19 +678,21 @@ if sess["unlimited_type"] == "RECURRING" and sess.get("service_id"):
         # =========================================================
         # END OF TRANSACTION
         # =========================================================
-        if (
-            "ClassName=AwsModel" in content
-            and "MethodName=SaveIPCameraImageAsyn" in content
-        ):   # ⬅️ INDENTED
-            sess["wash_ts_last"] = ts
-            if not sess.get("invoice"):
-            # Hard safety — do NOT insert broken rows
-                sess = None
-                continue
-            if not sess.get("wash_type"):
-            # avoid inserting incomplete rows
-                sess = None
-                continue
+if (
+    "ClassName=AwsModel" in content
+    and "MethodName=SaveIPCameraImageAsyn" in content
+):
+    sess["wash_ts_last"] = ts
+
+    if not sess.get("invoice"):
+        # Hard safety — do NOT insert broken rows
+        sess = None
+        continue
+
+    if not sess.get("wash_type"):
+        # Avoid inserting incomplete rows
+        sess = None
+        continue
 
             rows.append({
                 "bill": sess.get("invoice"),
