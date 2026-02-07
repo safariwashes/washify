@@ -17,6 +17,7 @@ from botocore.config import Config
 from zoneinfo import ZoneInfo
 
 # ===================== FINANCIAL REGEX =====================
+DISPATCH_INVOICE_RE = re.compile(r"DoTransactionAfterDispatcher\s+(\d+)")
 
 TS_RE = re.compile(
     r"^\s*(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)\s*,\s*"
@@ -630,6 +631,11 @@ def parse_file(
         m = INVOICE_RE.search(content)
         if m:
             sess["invoice"] = int(m.group(1))
+
+        m = DISPATCH_INVOICE_RE.search(content)
+        if m:
+            sess["invoice"] = int(m.group(1))
+
 
         # =========================================================
         # NEW CUSTOMER → Wash Packages ONLY
