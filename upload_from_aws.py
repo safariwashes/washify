@@ -47,6 +47,7 @@ DISCOUNT_AMOUNT_RE = re.compile(
     re.IGNORECASE
 )
 
+INVOICE_RE = re.compile(r"InvoiceID\s+(\d+)", re.IGNORECASE)
 
 # Optional .env support
 try:
@@ -626,6 +627,10 @@ def parse_file(
         if m:
             sess["total"] = float(m.group(1))
 
+        m = INVOICE_RE.search(content)
+        if m:
+            sess["invoice"] = int(m.group(1))
+
         # =========================================================
         # NEW CUSTOMER → Wash Package
         # =========================================================
@@ -673,6 +678,10 @@ def parse_file(
             and "MethodName=OpenGate" in content
         ):   # ⬅️ INDENTED
             sess["wash_ts_last"] = ts
+            if not sess.get("invoice"):
+            # Hard safety — do NOT insert broken rows
+                sess = None
+                continue
 
             rows.append({
                 "bill": sess.get("invoice"),
