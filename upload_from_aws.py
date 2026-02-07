@@ -408,34 +408,39 @@ def lookup_location_code(conn, location_id: str) -> Optional[str]:
 
 # ===================== NEW: WASH_RECURRING LOOKUP (TENANT-SCOPED) =====================
 def load_wash_recurring_map(conn, tenant_id: str) -> Dict[int, Dict[str, Any]]:
-    """
-    Map wash_package_id (ServiceID number) -> package info, filtered by tenant_id.
-    Expects wash_recurring has: tenant_id, wash_package_id, wash_package_name, wash_type
-    """
     out: Dict[int, Dict[str, Any]] = {}
+
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT wash_package_id, wash_package_name, wash_type, item_kind, addon_name
+            SELECT
+              wash_package_id,
+              wash_package_name,
+              wash_type,
+              COALESCE(item_kind, 'WASH') AS item_kind,
+              addon_name
             FROM wash_recurring
             WHERE tenant_id = %s
             """,
             (tenant_id,),
         )
-        rows = list(cur.fetchall())
+        rows = cur.fetchall()
+
     for r in rows:
         try:
             pid = int(r["wash_package_id"])
         except Exception:
             continue
+
         out[pid] = {
             "wash_package_id": pid,
             "wash_package_name": r.get("wash_package_name"),
             "wash_type": r.get("wash_type"),
+            "item_kind": r.get("item_kind", "WASH"),   # ✅ ADD THIS
+            "addon_name": r.get("addon_name"),         # ✅ ADD THIS
         }
+
     return out
-
-
 # ===================== PARSING REGEX =====================
 TS_RE = re.compile(
     r"^\s*(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)\s*,\s*"
