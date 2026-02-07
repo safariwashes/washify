@@ -656,7 +656,7 @@ def parse_file(
             sess["wash_ts_last"] = ts
 
             # Hard safety
-            if not sess.get("invoice") or not sess.get("wash_type"):
+            if not sess.get("wash_type"):
                 sess = None
                 continue
 
