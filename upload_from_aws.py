@@ -584,7 +584,7 @@ def parse_file(
         # =========================================================
         if (
             "ClassName=RFID Unlimited" in content
-            and "MethodName=BindCustomerVehicleInformation" in content
+            and ("MethodName=BindCustomerVehicleInformation" in content or "MethodName=SelectOptionsViewModel" in content)
             and ("Message=NEW CUSTOMER" in content or "Message=RECURRING" in content)
         ):
             sess = new_session()
