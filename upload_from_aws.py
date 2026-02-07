@@ -17,7 +17,6 @@ from botocore.config import Config
 from zoneinfo import ZoneInfo
 
 # ===================== FINANCIAL REGEX =====================
-DISPATCH_INVOICE_RE = re.compile(r"DoTransactionAfterDispatcher\s+(\d+)")
 
 TS_RE = re.compile(
     r"^\s*(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)\s*,\s*"
@@ -568,6 +567,11 @@ def parse_file(
             "customer_name": None,
             "payment_type": None,
             "image_path": None,
+            "discount_code": None,
+            "discount_amount": 0.0,
+            "tax": 0.0,
+            "total": 0.0,
+            "tip_amount": 0.0,
         }
 
     for raw in lines[start_index:]:
@@ -576,12 +580,11 @@ def parse_file(
             continue
 
         # =========================================================
-        # START OF TRANSACTION (only if no active session)
+        # START OF TRANSACTION (NEW or RECURRING)
         # =========================================================
         if (
-            sess is None
-            and "ClassName=RFID Unlimited" in content
-            and "MethodName=BindCustomerVehicleInformation" in content
+            "ClassName=RFID Unlimited" in content
+            and ("MethodName=BindCustomerVehicleInformation" in content or "MethodName=SelectOptionsViewModel" in content)
             and ("Message=NEW CUSTOMER" in content or "Message=RECURRING" in content)
         ):
             sess = new_session()
@@ -590,7 +593,7 @@ def parse_file(
             if "Message=RECURRING" in content:
                 sess["unlimited_type"] = "RECURRING"
 
-                # RECURRING → ServiceID ONLY
+                # Extract ServiceID immediately
                 m = SERVICE_ID_RE.search(content)
                 if m:
                     sess["service_id"] = int(m.group(1))
@@ -601,7 +604,6 @@ def parse_file(
                         sess["wash_type"] = rec["wash_type"]
             else:
                 sess["unlimited_type"] = "NEW"
-                sess["service_id"] = None
 
             continue
 
@@ -631,46 +633,61 @@ def parse_file(
         if m:
             sess["invoice"] = int(m.group(1))
 
-        m = DISPATCH_INVOICE_RE.search(content)
-        if m:
-            sess["invoice"] = int(m.group(1))
-
         # =========================================================
-        # NEW CUSTOMER → Wash Packages ONLY
+        # NEW CUSTOMER → Wash + Add-ons
+        # RULE: first WASH wins, ADDONs never overwrite wash
         # =========================================================
         if sess["unlimited_type"] == "NEW":
             m = WASH_PKG_RE.search(content)
             if m:
                 pkg_id = int(m.group(1))
-                rec = wash_recurring_map.get(pkg_id)
+                pkg_name = normalize_ws_name(m.group(2))
+
+                rec = next(
+                    (
+                        r for r in wash_recurring_map.values()
+                        if r.get("wash_package_name", "").lower() == pkg_name.lower()
+                    ),
+                    None,
+                )
 
                 if rec:
                     if rec["item_kind"] == "WASH":
+                        # Lock the first wash only
                         if not sess["wash_package_id"]:
                             sess["wash_package_id"] = rec["wash_package_id"]
                             sess["wash_package_name"] = rec["wash_package_name"]
                             sess["wash_type"] = rec["wash_type"]
                     elif rec["item_kind"] == "ADDON":
                         sess["addons"].add(rec["addon_name"])
+                else:
+                    # Fallback to rules ONLY if wash not set yet
+                    if not sess["wash_package_id"]:
+                        mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
+                        if mapped:
+                            sess["wash_package_id"] = pkg_id
+                            sess["wash_package_name"] = pkg_name
+                            sess["wash_type"] = mapped
 
         # =========================================================
-        # CAMERA EVENT → timestamp only (NOT close)
+        # END OF TRANSACTION
+        # Camera image is the most reliable boundary
         # =========================================================
         if (
             "ClassName=AwsModel" in content
             and "MethodName=SaveIPCameraImageAsync" in content
         ):
             sess["wash_ts_last"] = ts
-            continue
 
-        # =========================================================
-        # FINALIZE TRANSACTION → invoice is truth
-        # =========================================================
-        if sess.get("invoice") and sess.get("wash_type"):
+            # Final safety checks
+            if not sess.get("invoice") or not sess.get("wash_type"):
+                sess = None
+                continue
+
             rows.append({
                 "bill": sess["invoice"],
                 "wash_ts_first": sess["wash_ts_first"],
-                "wash_ts_last": sess.get("wash_ts_last") or ts,
+                "wash_ts_last": sess["wash_ts_last"],
                 "license_plate": sess["license_plate"],
                 "customer_name": sess["customer_name"],
                 "wash_package_id": sess["wash_package_id"],
@@ -678,7 +695,7 @@ def parse_file(
                 "wash_type": sess["wash_type"],
                 "payment_type": sess["payment_type"],
                 "image_path": sess["image_path"],
-                "is_unlimited": sess["unlimited_type"] == "RECURRING",
+                "is_unlimited": True,
                 "unlimited_type": sess["unlimited_type"],
                 "addons": ", ".join(sorted(sess["addons"])) or None,
                 "location": location_label,
@@ -688,33 +705,8 @@ def parse_file(
                 "created_at": now_cst_time(),
                 "invoice_kind": "WASH",
             })
-            sess = None
 
-    # =========================================================
-    # EOF SAFETY — flush last session
-    # =========================================================
-    if sess and sess.get("invoice") and sess.get("wash_type"):
-        rows.append({
-            "bill": sess["invoice"],
-            "wash_ts_first": sess["wash_ts_first"],
-            "wash_ts_last": sess.get("wash_ts_last"),
-            "license_plate": sess["license_plate"],
-            "customer_name": sess["customer_name"],
-            "wash_package_id": sess["wash_package_id"],
-            "wash_package_name": sess["wash_package_name"],
-            "wash_type": sess["wash_type"],
-            "payment_type": sess["payment_type"],
-            "image_path": sess["image_path"],
-            "is_unlimited": sess["unlimited_type"] == "RECURRING",
-            "unlimited_type": sess["unlimited_type"],
-            "addons": ", ".join(sorted(sess["addons"])) or None,
-            "location": location_label,
-            "lane_no": lane_no,
-            "source_file": path.name,
-            "created_on": now_cst_date(),
-            "created_at": now_cst_time(),
-            "invoice_kind": "WASH",
-        })
+            sess = None
 
     return rows
 
