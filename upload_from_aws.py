@@ -578,7 +578,7 @@ def parse_file(
             continue
 
         # =========================================================
-        # START OF TRANSACTION (NEW or RECURRING)
+        # START OF TRANSACTION
         # =========================================================
         if (
             "ClassName=RFID Unlimited" in content
@@ -596,7 +596,7 @@ def parse_file(
             continue
 
         # =========================================================
-        # Common field capture
+        # COMMON FIELD CAPTURE
         # =========================================================
         m = LICENSE_PLATE_RE.search(content)
         if m:
@@ -634,7 +634,7 @@ def parse_file(
         # =========================================================
         # NEW CUSTOMER → Wash Package
         # =========================================================
-        if sess["unlimited_type"] == "NEW":   # ⬅️ INDENTED
+        if sess["unlimited_type"] == "NEW":
             m = WASH_PKG_RE.search(content)
             if m:
                 pkg_id = int(m.group(1))
@@ -662,40 +662,44 @@ def parse_file(
                         sess["wash_package_name"] = pkg_name
                         sess["wash_type"] = mapped
 
-# =========================================================
-# RESOLVE RECURRING → wash_recurring (FINAL)
-# =========================================================
-if sess["unlimited_type"] == "RECURRING" and sess.get("service_id"):
-    rec = wash_recurring_map.get(sess["service_id"])
-    if rec:
-        if rec["item_kind"] == "WASH":
-            sess["wash_package_id"] = rec["wash_package_id"]
-            sess["wash_package_name"] = rec["wash_package_name"]
-            sess["wash_type"] = rec["wash_type"]
-        elif rec["item_kind"] == "ADDON":
-            sess["addons"].add(rec["addon_name"])
+        # =========================================================
+        # RECURRING → ServiceID
+        # =========================================================
+        if sess["unlimited_type"] == "RECURRING":
+            m = SERVICE_ID_RE.search(content)
+            if m:
+                sess["service_id"] = int(m.group(1))
+
+            # Resolve recurring package
+            if sess.get("service_id"):
+                rec = wash_recurring_map.get(sess["service_id"])
+                if rec:
+                    if rec["item_kind"] == "WASH":
+                        sess["wash_package_id"] = rec["wash_package_id"]
+                        sess["wash_package_name"] = rec["wash_package_name"]
+                        sess["wash_type"] = rec["wash_type"]
+                    elif rec["item_kind"] == "ADDON":
+                        sess["addons"].add(rec["addon_name"])
 
         # =========================================================
-        # END OF TRANSACTION
+        # END OF TRANSACTION (Camera event)
         # =========================================================
-if (
-    "ClassName=AwsModel" in content
-    and "MethodName=SaveIPCameraImageAsyn" in content
-):
-    sess["wash_ts_last"] = ts
+        if (
+            "ClassName=AwsModel" in content
+            and "MethodName=SaveIPCameraImageAsyn" in content
+        ):
+            sess["wash_ts_last"] = ts
 
-    if not sess.get("invoice"):
-        # Hard safety — do NOT insert broken rows
-        sess = None
-        continue
+            if not sess.get("invoice"):
+                sess = None
+                continue
 
-    if not sess.get("wash_type"):
-        # Avoid inserting incomplete rows
-        sess = None
-        continue
+            if not sess.get("wash_type"):
+                sess = None
+                continue
 
-    rows.append({
-                "bill": sess.get("invoice"),
+            rows.append({
+                "bill": sess["invoice"],
                 "wash_ts_first": sess["wash_ts_first"],
                 "wash_ts_last": sess["wash_ts_last"],
                 "license_plate": sess["license_plate"],
@@ -721,10 +725,11 @@ if (
                 "invoice_kind": "WASH",
             })
 
-    sess = None
+            sess = None
 
     print("DEBUG: returning rows")
     return rows
+
 # ===================== UPSERT INTO POS =====================
 UPSERT_SQL = """
 INSERT INTO pos (
