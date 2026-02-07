@@ -567,11 +567,6 @@ def parse_file(
             "customer_name": None,
             "payment_type": None,
             "image_path": None,
-            "discount_code": None,
-            "discount_amount": 0.0,
-            "tax": 0.0,
-            "total": 0.0,
-            "tip_amount": 0.0,
         }
 
     for raw in lines[start_index:]:
@@ -584,26 +579,26 @@ def parse_file(
         # =========================================================
         if (
             "ClassName=RFID Unlimited" in content
-            and ("MethodName=BindCustomerVehicleInformation" in content or "MethodName=SelectOptionsViewModel" in content)
+            and "MethodName=BindCustomerVehicleInformation" in content
             and ("Message=NEW CUSTOMER" in content or "Message=RECURRING" in content)
         ):
             sess = new_session()
             sess["wash_ts_first"] = ts
+            sess["unlimited_type"] = (
+                "RECURRING" if "Message=RECURRING" in content else "NEW"
+            )
 
-            if "Message=RECURRING" in content:
-                sess["unlimited_type"] = "RECURRING"
-
-                # Extract ServiceID immediately
+            # 🔒 For RECURRING: resolve immediately by ServiceID
+            if sess["unlimited_type"] == "RECURRING":
                 m = SERVICE_ID_RE.search(content)
                 if m:
-                    sess["service_id"] = int(m.group(1))
-                    rec = wash_recurring_map.get(sess["service_id"])
-                    if rec and rec.get("item_kind") == "WASH":
+                    sid = int(m.group(1))
+                    sess["service_id"] = sid
+                    rec = wash_recurring_map.get(sid)
+                    if rec and rec["item_kind"] == "WASH":
                         sess["wash_package_id"] = rec["wash_package_id"]
                         sess["wash_package_name"] = rec["wash_package_name"]
                         sess["wash_type"] = rec["wash_type"]
-            else:
-                sess["unlimited_type"] = "NEW"
 
             continue
 
@@ -634,44 +629,25 @@ def parse_file(
             sess["invoice"] = int(m.group(1))
 
         # =========================================================
-        # NEW CUSTOMER → Wash + Add-ons
-        # RULE: first WASH wins, ADDONs never overwrite wash
+        # NEW CUSTOMER → Wash / Addons (ID-based ONLY)
         # =========================================================
         if sess["unlimited_type"] == "NEW":
             m = WASH_PKG_RE.search(content)
             if m:
                 pkg_id = int(m.group(1))
-                pkg_name = normalize_ws_name(m.group(2))
 
-                rec = next(
-                    (
-                        r for r in wash_recurring_map.values()
-                        if r.get("wash_package_name", "").lower() == pkg_name.lower()
-                    ),
-                    None,
-                )
-
+                rec = wash_recurring_map.get(pkg_id)
                 if rec:
                     if rec["item_kind"] == "WASH":
-                        # Lock the first wash only
-                        if not sess["wash_package_id"]:
+                        if not sess.get("wash_package_id"):
                             sess["wash_package_id"] = rec["wash_package_id"]
                             sess["wash_package_name"] = rec["wash_package_name"]
                             sess["wash_type"] = rec["wash_type"]
                     elif rec["item_kind"] == "ADDON":
                         sess["addons"].add(rec["addon_name"])
-                else:
-                    # Fallback to rules ONLY if wash not set yet
-                    if not sess["wash_package_id"]:
-                        mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
-                        if mapped:
-                            sess["wash_package_id"] = pkg_id
-                            sess["wash_package_name"] = pkg_name
-                            sess["wash_type"] = mapped
 
         # =========================================================
-        # END OF TRANSACTION
-        # Camera image is the most reliable boundary
+        # END OF TRANSACTION (Camera event = authoritative end)
         # =========================================================
         if (
             "ClassName=AwsModel" in content
@@ -679,7 +655,7 @@ def parse_file(
         ):
             sess["wash_ts_last"] = ts
 
-            # Final safety checks
+            # Hard safety
             if not sess.get("invoice") or not sess.get("wash_type"):
                 sess = None
                 continue
