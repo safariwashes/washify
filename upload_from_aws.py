@@ -662,24 +662,33 @@ def parse_file(
                         sess["wash_package_name"] = pkg_name
                         sess["wash_type"] = mapped
 
-        # =========================================================
-        # RECURRING → ServiceID
-        # =========================================================
-        if sess["unlimited_type"] == "RECURRING":   # ⬅️ INDENTED
-            m = SERVICE_ID_RE.search(content)
-            if m:
-                sess["service_id"] = int(m.group(1))
+# =========================================================
+# RESOLVE RECURRING → wash_recurring (FINAL)
+# =========================================================
+if sess["unlimited_type"] == "RECURRING" and sess.get("service_id"):
+    rec = wash_recurring_map.get(sess["service_id"])
+    if rec:
+        if rec["item_kind"] == "WASH":
+            sess["wash_package_id"] = rec["wash_package_id"]
+            sess["wash_package_name"] = rec["wash_package_name"]
+            sess["wash_type"] = rec["wash_type"]
+        elif rec["item_kind"] == "ADDON":
+            sess["addons"].add(rec["addon_name"])
 
         # =========================================================
         # END OF TRANSACTION
         # =========================================================
         if (
-            "ClassName=ProceedToCarWashViewModel" in content
-            and "MethodName=OpenGate" in content
+            "ClassName=AwsModel" in content
+            and "MethodName=SaveIPCameraImageAsyn" in content
         ):   # ⬅️ INDENTED
             sess["wash_ts_last"] = ts
             if not sess.get("invoice"):
             # Hard safety — do NOT insert broken rows
+                sess = None
+                continue
+            if not sess.get("wash_type"):
+            # avoid inserting incomplete rows
                 sess = None
                 continue
 
