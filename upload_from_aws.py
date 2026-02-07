@@ -546,9 +546,11 @@ def parse_file(
     rows: List[Dict[str, Any]] = []
     sess: Optional[Dict[str, Any]] = None
 
-    lines = preloaded_lines if preloaded_lines is not None else path.read_text(
-        errors="ignore"
-    ).splitlines()
+    lines = (
+        preloaded_lines
+        if preloaded_lines is not None
+        else path.read_text(errors="ignore").splitlines()
+    )
 
     def new_session():
         return {
@@ -559,7 +561,7 @@ def parse_file(
             "wash_package_name": None,
             "wash_type": None,
             "service_id": None,
-            "unlimited_type": None,
+            "unlimited_type": None,  # NEW | RECURRING
             "addons": set(),
             "license_plate": None,
             "customer_name": None,
@@ -591,11 +593,12 @@ def parse_file(
             if "Message=RECURRING" in content:
                 sess["unlimited_type"] = "RECURRING"
 
+                # 🔹 Extract ServiceID immediately
                 m = SERVICE_ID_RE.search(content)
                 if m:
                     sess["service_id"] = int(m.group(1))
                     rec = wash_recurring_map.get(sess["service_id"])
-                    if rec and rec["item_kind"] == "WASH":
+                    if rec and rec.get("item_kind") == "WASH":
                         sess["wash_package_id"] = rec["wash_package_id"]
                         sess["wash_package_name"] = rec["wash_package_name"]
                         sess["wash_type"] = rec["wash_type"]
@@ -631,7 +634,8 @@ def parse_file(
             sess["invoice"] = int(m.group(1))
 
         # =========================================================
-        # NEW CUSTOMER → Wash Package
+        # NEW CUSTOMER → Wash + Addons
+        # FIX: first WASH wins, ADDONs never overwrite wash
         # =========================================================
         if sess["unlimited_type"] == "NEW":
             m = WASH_PKG_RE.search(content)
@@ -644,19 +648,22 @@ def parse_file(
                         r for r in wash_recurring_map.values()
                         if r["wash_package_name"].lower() == pkg_name.lower()
                     ),
-                    None
+                    None,
                 )
 
                 if rec:
                     if rec["item_kind"] == "WASH":
-                        sess["wash_package_id"] = rec["wash_package_id"]
-                        sess["wash_package_name"] = rec["wash_package_name"]
-                        sess["wash_type"] = rec["wash_type"]
+                        # 🔒 DO NOT overwrite an existing wash
+                        if not sess.get("wash_package_id"):
+                            sess["wash_package_id"] = rec["wash_package_id"]
+                            sess["wash_package_name"] = rec["wash_package_name"]
+                            sess["wash_type"] = rec["wash_type"]
+
                     elif rec["item_kind"] == "ADDON":
                         sess["addons"].add(rec["addon_name"])
 
         # =========================================================
-        # END OF TRANSACTION (Camera event)
+        # END OF TRANSACTION (Camera event = reliable end)
         # =========================================================
         if (
             "ClassName=AwsModel" in content
@@ -664,6 +671,7 @@ def parse_file(
         ):
             sess["wash_ts_last"] = ts
 
+            # Safety checks
             if not sess.get("invoice") or not sess.get("wash_type"):
                 sess = None
                 continue
