@@ -578,7 +578,7 @@ def parse_file(
             continue
 
         # =========================================================
-        # START OF TRANSACTION
+        # START OF TRANSACTION (NEW or RECURRING)
         # =========================================================
         if (
             "ClassName=RFID Unlimited" in content
@@ -587,9 +587,21 @@ def parse_file(
         ):
             sess = new_session()
             sess["wash_ts_first"] = ts
-            sess["unlimited_type"] = (
-                "RECURRING" if "Message=RECURRING" in content else "NEW"
-            )
+
+            if "Message=RECURRING" in content:
+                sess["unlimited_type"] = "RECURRING"
+
+                m = SERVICE_ID_RE.search(content)
+                if m:
+                    sess["service_id"] = int(m.group(1))
+                    rec = wash_recurring_map.get(sess["service_id"])
+                    if rec and rec["item_kind"] == "WASH":
+                        sess["wash_package_id"] = rec["wash_package_id"]
+                        sess["wash_package_name"] = rec["wash_package_name"]
+                        sess["wash_type"] = rec["wash_type"]
+            else:
+                sess["unlimited_type"] = "NEW"
+
             continue
 
         if not sess:
@@ -613,19 +625,6 @@ def parse_file(
         m = AWS_FILE_RE.search(content)
         if m:
             sess["image_path"] = normalize_image_path(m.group(1), sess.get("invoice"))
-
-        m = DISCOUNT_BOTH_RE.search(content)
-        if m:
-            sess["discount_code"] = m.group(1)
-            sess["discount_amount"] = float(m.group(2))
-
-        m = TAX_RE.search(content)
-        if m:
-            sess["tax"] = float(m.group(1))
-
-        m = TOTAL_RE.search(content)
-        if m:
-            sess["total"] = float(m.group(1))
 
         m = INVOICE_RE.search(content)
         if m:
@@ -655,46 +654,17 @@ def parse_file(
                         sess["wash_type"] = rec["wash_type"]
                     elif rec["item_kind"] == "ADDON":
                         sess["addons"].add(rec["addon_name"])
-                else:
-                    mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
-                    if mapped:
-                        sess["wash_package_id"] = pkg_id
-                        sess["wash_package_name"] = pkg_name
-                        sess["wash_type"] = mapped
-
-        # =========================================================
-        # RECURRING → ServiceID
-        # =========================================================
-        if sess["unlimited_type"] == "RECURRING":
-            m = SERVICE_ID_RE.search(content)
-            if m:
-                sess["service_id"] = int(m.group(1))
-
-            # Resolve recurring package
-            if sess.get("service_id"):
-                rec = wash_recurring_map.get(sess["service_id"])
-                if rec:
-                    if rec["item_kind"] == "WASH":
-                        sess["wash_package_id"] = rec["wash_package_id"]
-                        sess["wash_package_name"] = rec["wash_package_name"]
-                        sess["wash_type"] = rec["wash_type"]
-                    elif rec["item_kind"] == "ADDON":
-                        sess["addons"].add(rec["addon_name"])
 
         # =========================================================
         # END OF TRANSACTION (Camera event)
         # =========================================================
         if (
             "ClassName=AwsModel" in content
-            and "MethodName=SaveIPCameraImageAsyn" in content
+            and "MethodName=SaveIPCameraImageAsync" in content
         ):
             sess["wash_ts_last"] = ts
 
-            if not sess.get("invoice"):
-                sess = None
-                continue
-
-            if not sess.get("wash_type"):
+            if not sess.get("invoice") or not sess.get("wash_type"):
                 sess = None
                 continue
 
@@ -712,11 +682,6 @@ def parse_file(
                 "is_unlimited": True,
                 "unlimited_type": sess["unlimited_type"],
                 "addons": ", ".join(sorted(sess["addons"])) or None,
-                "tip_amount": sess["tip_amount"],
-                "discount_code": sess["discount_code"],
-                "discount_amount": sess["discount_amount"],
-                "tax": sess["tax"],
-                "total": sess["total"],
                 "location": location_label,
                 "lane_no": lane_no,
                 "source_file": path.name,
@@ -727,7 +692,6 @@ def parse_file(
 
             sess = None
 
-    print("DEBUG: returning rows")
     return rows
 
 # ===================== UPSERT INTO POS =====================
