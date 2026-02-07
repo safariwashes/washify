@@ -576,10 +576,11 @@ def parse_file(
             continue
 
         # =========================================================
-        # START OF TRANSACTION
+        # START OF TRANSACTION (ONLY if no active session)
         # =========================================================
         if (
-            "ClassName=RFID Unlimited" in content
+            sess is None
+            and "ClassName=RFID Unlimited" in content
             and "MethodName=BindCustomerVehicleInformation" in content
             and ("Message=NEW CUSTOMER" in content or "Message=RECURRING" in content)
         ):
@@ -589,18 +590,16 @@ def parse_file(
             if "Message=RECURRING" in content:
                 sess["unlimited_type"] = "RECURRING"
 
-                # ✅ RECURRING → ServiceID ONLY
+                # RECURRING → ServiceID only
                 m = SERVICE_ID_RE.search(content)
                 if m:
                     sess["service_id"] = int(m.group(1))
                     rec = wash_recurring_map.get(sess["service_id"])
-                    if rec and rec["item_kind"] == "WASH":
+                    if rec and rec.get("item_kind") == "WASH":
                         sess["wash_package_id"] = rec["wash_package_id"]
                         sess["wash_package_name"] = rec["wash_package_name"]
                         sess["wash_type"] = rec["wash_type"]
-
             else:
-                # ✅ NEW CUSTOMER → IGNORE ServiceID
                 sess["unlimited_type"] = "NEW"
                 sess["service_id"] = None
 
@@ -636,9 +635,8 @@ def parse_file(
         if m:
             sess["invoice"] = int(m.group(1))
 
-
         # =========================================================
-        # NEW CUSTOMER → Wash Packages ONLY
+        # NEW CUSTOMER → Wash Packages ONLY (ignore ServiceID)
         # =========================================================
         if sess["unlimited_type"] == "NEW":
             m = WASH_PKG_RE.search(content)
@@ -648,12 +646,11 @@ def parse_file(
 
                 if rec:
                     if rec["item_kind"] == "WASH":
-                        # 🔒 first WASH wins
+                        # first WASH wins
                         if not sess["wash_package_id"]:
                             sess["wash_package_id"] = rec["wash_package_id"]
                             sess["wash_package_name"] = rec["wash_package_name"]
                             sess["wash_type"] = rec["wash_type"]
-
                     elif rec["item_kind"] == "ADDON":
                         sess["addons"].add(rec["addon_name"])
 
