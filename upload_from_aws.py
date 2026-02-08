@@ -573,6 +573,7 @@ def parse_file(
             "wash_package_name": None,
             "wash_type": None,
             "addons": set(),
+            "tip_amount": 0.0,
         }
 
     def finalize(ts):
@@ -664,7 +665,9 @@ def parse_file(
 
         m = CUSTOMER_NAME_RE.search(content)
         if m:
-            sess["customer_name"] = m.group(1).strip()
+            name = m.group(1).strip()
+            if name:
+                sess["customer_name"] = name
 
         m = PAYMENT_TYPE_RE.search(content)
         if m:
@@ -698,17 +701,34 @@ def parse_file(
                     None,
                 )
 
-                if rec and rec.get("item_kind") == "WASH":
+                if rec:
+                    kind = rec.get("item_kind")
+                    if kind == "WASH":
+                        # lock first wash only
+                        if not sess["wash_package_id"]:
+                            sess["wash_package_id"] = rec["wash_package_id"]
+                            sess["wash_package_name"] = rec["wash_package_name"]
+                            sess["wash_type"] = rec["wash_type"]
+                    elif kind == "ADDON":
+                        addon_name = rec.get("addon_name") or rec.get("wash_package_name")
+                        if addon_name:
+                            sess["addons"].add(addon_name)
+                    elif kind == "TIP":
+                        # extract numeric value from package name
+                        m = re.search(r"\$\s*(\d+(?:\.\d+)?)", rec.get("wash_package_name",""))
+                        if m:
+                            try:
+                                sess["tip_amount"] += float(m.group(1))
+                            except Exception:
+                                pass
+                else:
+                    # fallback ONLY if wash not set yet
                     if not sess["wash_package_id"]:
-                        sess["wash_package_id"] = rec["wash_package_id"]
-                        sess["wash_package_name"] = rec["wash_package_name"]
-                        sess["wash_type"] = rec["wash_type"]
-                elif not sess["wash_package_id"]:
-                    mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
-                    if mapped:
-                        sess["wash_package_id"] = pkg_id
-                        sess["wash_package_name"] = pkg_name
-                        sess["wash_type"] = mapped
+                        mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
+                        if mapped:
+                            sess["wash_package_id"] = pkg_id
+                            sess["wash_package_name"] = pkg_name
+                            sess["wash_type"] = mapped
 
         # recurring resolution
         if sess["saw_recurring"] and sess.get("service_id") and not sess.get("wash_type"):
