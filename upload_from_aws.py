@@ -561,22 +561,6 @@ def parse_file(
     CAMERA_INVOICE_RE = re.compile(r"Invoice(?:ID|Id)\s*=?\s*(\d+)", re.IGNORECASE)
     TIP_RE = re.compile(r"\$\s*(\d+(?:\.\d+)?)")
 
-    def infer_signup_wash_type(pkg_name: str):
-        """
-        Best Wash Unlimited -> Best
-        Super Unlimited -> Super
-        """
-        if not pkg_name:
-            return None
-        base = (
-            pkg_name
-            .replace("Unlimited", "")
-            .replace("UNLIMITED", "")
-            .replace("Wash", "")
-            .strip()
-        )
-        return base or None
-
     def new_session(ts):
         return {
             "wash_ts_first": ts,
@@ -613,15 +597,16 @@ def parse_file(
 
         is_unlimited = sess["unlimited_type"] in ("RECURRING", "SIGNUP")
 
-        # 🔑 FINAL SIGNUP FIX (THIS WAS MISSING)
+        # 🔑 FINAL + CORRECT SIGNUP FIX
         if (
             sess["unlimited_type"] == "SIGNUP"
-            and not sess.get("wash_type")
-            and sess.get("wash_package_name")
+            and not sess["wash_type"]
+            and sess.get("wash_package_id")
         ):
-            inferred = infer_signup_wash_type(sess["wash_package_name"])
-            if inferred:
-                sess["wash_type"] = inferred
+            rec = wash_recurring_map.get(sess["wash_package_id"])
+            if rec and rec.get("item_kind") == "WASH":
+                sess["wash_package_name"] = rec["wash_package_name"]
+                sess["wash_type"] = rec["wash_type"]
 
         if not sess.get("invoice"):
             sess = None
@@ -733,19 +718,15 @@ def parse_file(
                     pass
                 continue
 
-            rec = next(
-                (r for r in wash_recurring_map.values()
-                 if (r.get("wash_package_name") or "").lower() == pkg_name.lower()),
-                None,
-            )
+            # 🔑 ALWAYS trust package_id
+            rec = wash_recurring_map.get(pkg_id)
 
             if rec:
                 kind = rec.get("item_kind")
                 if kind == "WASH":
-                    if not sess["wash_package_id"] or sess["saw_signup"]:
-                        sess["wash_package_id"] = rec["wash_package_id"]
-                        sess["wash_package_name"] = rec["wash_package_name"]
-                        sess["wash_type"] = rec["wash_type"]
+                    sess["wash_package_id"] = rec["wash_package_id"]
+                    sess["wash_package_name"] = rec["wash_package_name"]
+                    sess["wash_type"] = rec["wash_type"]
                 elif kind == "ADDON":
                     addon_name = rec.get("addon_name") or rec.get("wash_package_name")
                     if addon_name:
