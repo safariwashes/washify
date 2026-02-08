@@ -717,7 +717,7 @@ def parse_file(
             if rec:
                 kind = rec.get("item_kind")
                 if kind == "WASH":
-                    if not sess["wash_package_id"]:
+                    if not sess["wash_package_id"] or sess["saw_signup"]:
                         sess["wash_package_id"] = rec["wash_package_id"]
                         sess["wash_package_name"] = rec["wash_package_name"]
                         sess["wash_type"] = rec["wash_type"]
