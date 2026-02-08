@@ -548,7 +548,7 @@ def parse_file(
     rows = []
     sess = None
 
-    # 🔑 pending values seen before RFID Unlimited
+    # pending values seen before RFID Unlimited
     pending_customer_name = None
     pending_license_plate = None
 
@@ -560,6 +560,22 @@ def parse_file(
 
     CAMERA_INVOICE_RE = re.compile(r"Invoice(?:ID|Id)\s*=?\s*(\d+)", re.IGNORECASE)
     TIP_RE = re.compile(r"\$\s*(\d+(?:\.\d+)?)")
+
+    def infer_signup_wash_type(pkg_name: str):
+        """
+        Best Wash Unlimited -> Best
+        Super Unlimited -> Super
+        """
+        if not pkg_name:
+            return None
+        base = (
+            pkg_name
+            .replace("Unlimited", "")
+            .replace("UNLIMITED", "")
+            .replace("Wash", "")
+            .strip()
+        )
+        return base or None
 
     def new_session(ts):
         return {
@@ -597,6 +613,16 @@ def parse_file(
 
         is_unlimited = sess["unlimited_type"] in ("RECURRING", "SIGNUP")
 
+        # 🔑 FINAL SIGNUP FIX (THIS WAS MISSING)
+        if (
+            sess["unlimited_type"] == "SIGNUP"
+            and not sess.get("wash_type")
+            and sess.get("wash_package_name")
+        ):
+            inferred = infer_signup_wash_type(sess["wash_package_name"])
+            if inferred:
+                sess["wash_type"] = inferred
+
         if not sess.get("invoice"):
             sess = None
             return
@@ -631,7 +657,7 @@ def parse_file(
         if not ts or not content:
             continue
 
-        # -------- Capture fields BEFORE session --------
+        # capture fields BEFORE session
         m = CUSTOMER_NAME_RE.search(content)
         if m:
             pending_customer_name = m.group(1).strip()
@@ -640,7 +666,7 @@ def parse_file(
         if m:
             pending_license_plate = m.group(1)
 
-        # -------- START transaction --------
+        # START transaction
         if (
             "ClassName=RFID Unlimited" in content
             and (
@@ -663,7 +689,7 @@ def parse_file(
         if not sess:
             continue
 
-        # -------- Flags --------
+        # flags
         if "Message=RECURRING" in content:
             sess["saw_recurring"] = True
 
@@ -673,7 +699,7 @@ def parse_file(
         ):
             sess["saw_signup"] = True
 
-        # -------- Common fields --------
+        # common fields
         m = PAYMENT_TYPE_RE.search(content)
         if m:
             sess["payment_type"] = m.group(1)
@@ -692,14 +718,13 @@ def parse_file(
             if m2:
                 sess["invoice"] = int(m2.group(1))
 
-        # -------- Wash package / Addons / Tip --------
+        # wash package / addons / tip
         m = WASH_PKG_RE.search(content)
         if m:
             pkg_id = int(m.group(1))
             pkg_name = normalize_ws_name(m.group(2))
-            up = pkg_name.upper()
 
-            # TIP detection (always capture)
+            # TIP
             tip_m = TIP_RE.search(pkg_name)
             if tip_m:
                 try:
@@ -733,7 +758,7 @@ def parse_file(
                         sess["wash_package_name"] = pkg_name
                         sess["wash_type"] = mapped
 
-        # -------- RECURRING resolution --------
+        # recurring resolution
         if sess["saw_recurring"] and sess.get("service_id") and not sess.get("wash_type"):
             rec = wash_recurring_map.get(sess["service_id"])
             if rec and rec.get("item_kind") == "WASH":
@@ -741,7 +766,7 @@ def parse_file(
                 sess["wash_package_name"] = rec["wash_package_name"]
                 sess["wash_type"] = rec["wash_type"]
 
-        # -------- END transaction --------
+        # END transaction (camera = truth)
         if (
             "ClassName=AwsModel" in content
             and "MethodName=SaveIPCameraImageAsync" in content
