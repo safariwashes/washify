@@ -548,6 +548,10 @@ def parse_file(
     rows = []
     sess = None
 
+    # 🔑 pending values seen before RFID Unlimited
+    pending_customer_name = None
+    pending_license_plate = None
+
     lines = (
         preloaded_lines
         if preloaded_lines is not None
@@ -555,14 +559,15 @@ def parse_file(
     )
 
     CAMERA_INVOICE_RE = re.compile(r"Invoice(?:ID|Id)\s*=?\s*(\d+)", re.IGNORECASE)
+    TIP_RE = re.compile(r"\$\s*(\d+(?:\.\d+)?)")
 
     def new_session(ts):
         return {
             "wash_ts_first": ts,
             "wash_ts_last": None,
             "invoice": None,
-            "license_plate": None,
-            "customer_name": None,
+            "license_plate": pending_license_plate,
+            "customer_name": pending_customer_name,
             "payment_type": None,
             "image_path": None,
             "saw_recurring": False,
@@ -610,6 +615,7 @@ def parse_file(
             "is_unlimited": is_unlimited,
             "unlimited_type": sess["unlimited_type"],
             "addons": ", ".join(sorted(sess["addons"])) or None,
+            "tip_amount": round(sess["tip_amount"], 2),
             "location": location_label,
             "lane_no": lane_no,
             "source_file": path.name,
@@ -625,7 +631,16 @@ def parse_file(
         if not ts or not content:
             continue
 
-        # START transaction
+        # -------- Capture fields BEFORE session --------
+        m = CUSTOMER_NAME_RE.search(content)
+        if m:
+            pending_customer_name = m.group(1).strip()
+
+        m = LICENSE_PLATE_RE.search(content)
+        if m:
+            pending_license_plate = m.group(1)
+
+        # -------- START transaction --------
         if (
             "ClassName=RFID Unlimited" in content
             and (
@@ -648,7 +663,7 @@ def parse_file(
         if not sess:
             continue
 
-        # flags
+        # -------- Flags --------
         if "Message=RECURRING" in content:
             sess["saw_recurring"] = True
 
@@ -658,17 +673,7 @@ def parse_file(
         ):
             sess["saw_signup"] = True
 
-        # common fields
-        m = LICENSE_PLATE_RE.search(content)
-        if m:
-            sess["license_plate"] = m.group(1)
-
-        m = CUSTOMER_NAME_RE.search(content)
-        if m:
-            name = m.group(1).strip()
-            if name:
-                sess["customer_name"] = name
-
+        # -------- Common fields --------
         m = PAYMENT_TYPE_RE.search(content)
         if m:
             sess["payment_type"] = m.group(1)
@@ -687,50 +692,48 @@ def parse_file(
             if m2:
                 sess["invoice"] = int(m2.group(1))
 
-        # wash package
+        # -------- Wash package / Addons / Tip --------
         m = WASH_PKG_RE.search(content)
         if m:
             pkg_id = int(m.group(1))
             pkg_name = normalize_ws_name(m.group(2))
             up = pkg_name.upper()
 
-            if not up.startswith("TIP"):
-                rec = next(
-                    (r for r in wash_recurring_map.values()
-                     if (r.get("wash_package_name") or "").lower() == pkg_name.lower()),
-                    None,
-                )
+            # TIP detection (always capture)
+            tip_m = TIP_RE.search(pkg_name)
+            if tip_m:
+                try:
+                    sess["tip_amount"] += float(tip_m.group(1))
+                except Exception:
+                    pass
+                continue
 
-                if rec:
-                    kind = rec.get("item_kind")
-                    if kind == "WASH":
-                        # lock first wash only
-                        if not sess["wash_package_id"]:
-                            sess["wash_package_id"] = rec["wash_package_id"]
-                            sess["wash_package_name"] = rec["wash_package_name"]
-                            sess["wash_type"] = rec["wash_type"]
-                    elif kind == "ADDON":
-                        addon_name = rec.get("addon_name") or rec.get("wash_package_name")
-                        if addon_name:
-                            sess["addons"].add(addon_name)
-                    elif kind == "TIP":
-                        # extract numeric value from package name
-                        m = re.search(r"\$\s*(\d+(?:\.\d+)?)", rec.get("wash_package_name",""))
-                        if m:
-                            try:
-                                sess["tip_amount"] += float(m.group(1))
-                            except Exception:
-                                pass
-                else:
-                    # fallback ONLY if wash not set yet
+            rec = next(
+                (r for r in wash_recurring_map.values()
+                 if (r.get("wash_package_name") or "").lower() == pkg_name.lower()),
+                None,
+            )
+
+            if rec:
+                kind = rec.get("item_kind")
+                if kind == "WASH":
                     if not sess["wash_package_id"]:
-                        mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
-                        if mapped:
-                            sess["wash_package_id"] = pkg_id
-                            sess["wash_package_name"] = pkg_name
-                            sess["wash_type"] = mapped
+                        sess["wash_package_id"] = rec["wash_package_id"]
+                        sess["wash_package_name"] = rec["wash_package_name"]
+                        sess["wash_type"] = rec["wash_type"]
+                elif kind == "ADDON":
+                    addon_name = rec.get("addon_name") or rec.get("wash_package_name")
+                    if addon_name:
+                        sess["addons"].add(addon_name)
+            else:
+                if not sess["wash_package_id"]:
+                    mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
+                    if mapped:
+                        sess["wash_package_id"] = pkg_id
+                        sess["wash_package_name"] = pkg_name
+                        sess["wash_type"] = mapped
 
-        # recurring resolution
+        # -------- RECURRING resolution --------
         if sess["saw_recurring"] and sess.get("service_id") and not sess.get("wash_type"):
             rec = wash_recurring_map.get(sess["service_id"])
             if rec and rec.get("item_kind") == "WASH":
@@ -738,7 +741,7 @@ def parse_file(
                 sess["wash_package_name"] = rec["wash_package_name"]
                 sess["wash_type"] = rec["wash_type"]
 
-        # END transaction
+        # -------- END transaction --------
         if (
             "ClassName=AwsModel" in content
             and "MethodName=SaveIPCameraImageAsync" in content
