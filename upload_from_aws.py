@@ -47,7 +47,7 @@ DISCOUNT_AMOUNT_RE = re.compile(
     re.IGNORECASE
 )
 
-INVOICE_RE = re.compile(r"InvoiceID\s+(\d+)", re.IGNORECASE)
+INVOICE_RE = re.compile(r"Invoice(?:ID|Id)\s*(\d+)", re.IGNORECASE)
 
 # Optional .env support
 try:
