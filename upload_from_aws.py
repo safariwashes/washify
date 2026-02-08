@@ -543,8 +543,10 @@ def parse_file(
     lane_no: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
 
+    import re
+
     rows: List[Dict[str, Any]] = []
-    sess: Optional[Dict[str, Any]] = None
+    sess = None
 
     lines = (
         preloaded_lines
@@ -552,66 +554,51 @@ def parse_file(
         else path.read_text(errors="ignore").splitlines()
     )
 
-    # Robust invoice extraction (handles InvoiceID / InvoiceId / InvoiceID= / InvoiceId=)
     CAMERA_INVOICE_RE = re.compile(r"Invoice(?:ID|Id)\s*=?\s*(\d+)", re.IGNORECASE)
 
-    def new_session():
+    def new_session(ts):
         return {
-            "invoice": None,
-            "wash_ts_first": None,
+            "wash_ts_first": ts,
             "wash_ts_last": None,
+
+            "invoice": None,
             "license_plate": None,
             "customer_name": None,
             "payment_type": None,
             "image_path": None,
 
-            # transaction classification
-            "is_recurring": False,
-            "is_signup": False,          # based on CreditCardUnlimitedViewModel called
-            "unlimited_type": None,      # RECURRING | SIGNUP | NEW (optional)
+            # classification
+            "saw_recurring": False,
+            "saw_signup": False,   # CreditCardUnlimitedViewModel
+            "unlimited_type": None,
 
-            # recurring selector
-            "service_id": None,          # capture ServiceID if present
-
-            # wash selection
+            # selection
+            "service_id": None,
             "wash_package_id": None,
             "wash_package_name": None,
             "wash_type": None,
             "addons": set(),
-
-            # bookkeeping
-            "source_file": path.name,
         }
 
-    def finalize_and_append(ts_end: datetime):
+    def finalize(ts):
         nonlocal sess
         if not sess:
             return
 
-        sess["wash_ts_last"] = ts_end
+        sess["wash_ts_last"] = ts
 
-        # Determine unlimited flags
-        # - recurring => unlimited
-        # - signup => unlimited
-        # - otherwise treat as non-unlimited unless package name includes UNLIMITED
-        is_unlimited = bool(sess["is_recurring"] or sess["is_signup"] or (
-            (sess.get("wash_package_name") or "").upper().find("UNLIMITED") >= 0
-        ))
-
-        # Set unlimited_type (only if unlimited)
-        if is_unlimited:
-            if sess["is_recurring"]:
-                sess["unlimited_type"] = "RECURRING"
-            elif sess["is_signup"]:
-                sess["unlimited_type"] = "SIGNUP"
-            else:
-                sess["unlimited_type"] = "NEW"
+        # determine unlimited_type
+        if sess["saw_recurring"]:
+            sess["unlimited_type"] = "RECURRING"
+        elif sess["saw_signup"]:
+            sess["unlimited_type"] = "SIGNUP"
         else:
-            sess["unlimited_type"] = None
+            sess["unlimited_type"] = "NEW"
 
-        # Safety gate: must have invoice + wash_type
-        # (matches your expectation that these are wash transactions)
-        if not sess.get("invoice") or not sess.get("wash_type"):
+        is_unlimited = sess["unlimited_type"] in ("RECURRING", "SIGNUP")
+
+        # FINAL SAFETY: invoice is mandatory, wash_type is NOT optional
+        if not sess.get("invoice"):
             sess = None
             return
 
@@ -623,15 +610,15 @@ def parse_file(
             "customer_name": sess["customer_name"],
             "wash_package_id": sess["wash_package_id"],
             "wash_package_name": sess["wash_package_name"],
-            "wash_type": sess["wash_type"],
+            "wash_type": sess["wash_type"],   # may be None → allowed
             "payment_type": sess["payment_type"],
             "image_path": sess["image_path"],
-            "is_unlimited": bool(is_unlimited),
+            "is_unlimited": is_unlimited,
             "unlimited_type": sess["unlimited_type"],
             "addons": ", ".join(sorted(sess["addons"])) or None,
             "location": location_label,
             "lane_no": lane_no,
-            "source_file": sess["source_file"],
+            "source_file": path.name,
             "created_on": now_cst_date(),
             "created_at": now_cst_time(),
             "invoice_kind": "WASH",
@@ -641,12 +628,10 @@ def parse_file(
 
     for raw in lines[start_index:]:
         ts, content = parse_ts(raw.strip())
-        if not content or not ts:
+        if not ts or not content:
             continue
 
-        # =========================================================
-        # START OF TRANSACTION (Rule #1)
-        # =========================================================
+        # ---------------- START TRANSACTION ----------------
         if (
             "ClassName=RFID Unlimited" in content
             and (
@@ -654,175 +639,102 @@ def parse_file(
                 or "MethodName=BindCustomerVehicleInformation" in content
             )
         ):
-            # Start a brand new transaction window
-            sess = new_session()
-            sess["wash_ts_first"] = ts
+            sess = new_session(ts)
 
-            # Detect recurring immediately if present on the start line
             if "Message=RECURRING" in content:
-                sess["is_recurring"] = True
+                sess["saw_recurring"] = True
 
-            # Capture service_id if it appears here
             m = SERVICE_ID_RE.search(content)
             if m:
-                try:
-                    sid = int(m.group(1))
-                    if sid > 0:
-                        sess["service_id"] = sid
-                except Exception:
-                    pass
+                sid = int(m.group(1))
+                if sid > 0:
+                    sess["service_id"] = sid
 
             continue
 
         if not sess:
             continue
 
-        # =========================================================
-        # Inside transaction: recurring + signup markers (Rules #2, #4)
-        # =========================================================
+        # ---------------- FLAGS ----------------
         if "Message=RECURRING" in content:
-            sess["is_recurring"] = True
+            sess["saw_recurring"] = True
 
         if (
             "ClassName=CreditCardUnlimitedViewModel" in content
-            and "MethodName=CreditCardUnlimitedViewModel" in content
-            and "Message=CreditCardUnlimitedViewModel called" in content
+            and "CreditCardUnlimitedViewModel called" in content
         ):
-            sess["is_signup"] = True
+            sess["saw_signup"] = True
 
-        # ServiceID capture anywhere in transaction (Rule #2)
-        m = SERVICE_ID_RE.search(content)
-        if m:
-            try:
-                sid = int(m.group(1))
-                if sid > 0:
-                    sess["service_id"] = sid
-            except Exception:
-                pass
-
-        # =========================================================
-        # Common field capture (Rule #3)
-        # "grab all available" => keep latest non-empty
-        # =========================================================
+        # ---------------- COMMON FIELDS ----------------
         m = LICENSE_PLATE_RE.search(content)
         if m:
-            lp = m.group(1).strip()
-            if lp:
-                sess["license_plate"] = lp
+            sess["license_plate"] = m.group(1)
 
         m = CUSTOMER_NAME_RE.search(content)
         if m:
-            nm = m.group(1).strip()
-            if nm:
-                sess["customer_name"] = nm
+            sess["customer_name"] = m.group(1).strip()
 
         m = PAYMENT_TYPE_RE.search(content)
         if m:
-            pt = m.group(1).strip()
-            if pt:
-                sess["payment_type"] = pt
+            sess["payment_type"] = m.group(1)
 
         m = AWS_FILE_RE.search(content)
         if m:
             sess["image_path"] = normalize_image_path(m.group(1), sess.get("invoice"))
 
-        # Invoice capture via existing regex + camera-style regex
         m = INVOICE_RE.search(content)
         if m:
-            try:
-                inv = int(m.group(1))
-                if inv > 0:
-                    sess["invoice"] = inv
-            except Exception:
-                pass
+            inv = int(m.group(1))
+            if inv > 0:
+                sess["invoice"] = inv
         else:
             m2 = CAMERA_INVOICE_RE.search(content)
             if m2:
-                try:
-                    inv = int(m2.group(1))
-                    if inv > 0:
-                        sess["invoice"] = inv
-                except Exception:
-                    pass
+                sess["invoice"] = int(m2.group(1))
 
-        # =========================================================
-        # Wash package capture (Rules #2/#4)
-        # For recurring:
-        #   - prefer ServiceID>0 mapping
-        #   - else use Wash Package lines in this transaction
-        # For signup (SIGNUP) + non-recurring:
-        #   - use Wash Package lines in this transaction
-        # =========================================================
+        # ---------------- WASH PACKAGE ----------------
         m = WASH_PKG_RE.search(content)
         if m:
-            try:
-                pkg_id = int(m.group(1))
-            except Exception:
-                pkg_id = None
-
+            pkg_id = int(m.group(1))
             pkg_name = normalize_ws_name(m.group(2))
+            up = pkg_name.upper()
 
-            # Find matching record by name (for NEW/SIGNUP)
-            rec_by_name = next(
-                (
-                    r for r in wash_recurring_map.values()
-                    if (r.get("wash_package_name") or "").lower() == (pkg_name or "").lower()
-                ),
+            # ignore tips
+            if up.startswith("TIP"):
+                return
+
+            rec = next(
+                (r for r in wash_recurring_map.values()
+                 if (r.get("wash_package_name") or "").lower() == pkg_name.lower()),
                 None,
             )
 
-            if rec_by_name:
-                if rec_by_name.get("item_kind") == "WASH":
-                    # lock first wash only
-                    if not sess["wash_package_id"]:
-                        sess["wash_package_id"] = rec_by_name.get("wash_package_id") or pkg_id
-                        sess["wash_package_name"] = rec_by_name.get("wash_package_name") or pkg_name
-                        sess["wash_type"] = rec_by_name.get("wash_type")
-                elif rec_by_name.get("item_kind") == "ADDON":
-                    if rec_by_name.get("addon_name"):
-                        sess["addons"].add(rec_by_name["addon_name"])
-            else:
-                # fallback to rules only if wash not set yet
-                if not sess["wash_package_id"]:
-                    mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
-                    if mapped:
-                        sess["wash_package_id"] = pkg_id
-                        sess["wash_package_name"] = pkg_name
-                        sess["wash_type"] = mapped
-
-        # =========================================================
-        # If recurring and ServiceID is known, resolve wash via ServiceID
-        # (Rule #2: take ServiceID >0)
-        # =========================================================
-        if sess["is_recurring"] and sess.get("service_id") and not sess.get("wash_type"):
-            rec = wash_recurring_map.get(int(sess["service_id"]))
             if rec and rec.get("item_kind") == "WASH":
-                sess["wash_package_id"] = rec.get("wash_package_id")
-                sess["wash_package_name"] = rec.get("wash_package_name")
-                sess["wash_type"] = rec.get("wash_type")
+                if not sess["wash_package_id"]:
+                    sess["wash_package_id"] = rec["wash_package_id"]
+                    sess["wash_package_name"] = rec["wash_package_name"]
+                    sess["wash_type"] = rec["wash_type"]
+            elif not sess["wash_package_id"]:
+                mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
+                if mapped:
+                    sess["wash_package_id"] = pkg_id
+                    sess["wash_package_name"] = pkg_name
+                    sess["wash_type"] = mapped
 
-        # =========================================================
-        # END OF TRANSACTION (Rule #1)
-        # =========================================================
+        # ---------------- RECURRING RESOLUTION ----------------
+        if sess["saw_recurring"] and sess.get("service_id") and not sess.get("wash_type"):
+            rec = wash_recurring_map.get(sess["service_id"])
+            if rec and rec.get("item_kind") == "WASH":
+                sess["wash_package_id"] = rec["wash_package_id"]
+                sess["wash_package_name"] = rec["wash_package_name"]
+                sess["wash_type"] = rec["wash_type"]
+
+        # ---------------- END TRANSACTION ----------------
         if (
             "ClassName=AwsModel" in content
             and "MethodName=SaveIPCameraImageAsync" in content
-            and "Message=SaveIPCameraImageAsync" in content
         ):
-            # Make sure invoice is captured from the camera line if that’s where it appears
-            if not sess.get("invoice"):
-                mcam = CAMERA_INVOICE_RE.search(content)
-                if mcam:
-                    try:
-                        inv = int(mcam.group(1))
-                        if inv > 0:
-                            sess["invoice"] = inv
-                    except Exception:
-                        pass
-
-            # Finalize + append
-            finalize_and_append(ts)
-            continue
+            finalize(ts)
 
     return rows
 
