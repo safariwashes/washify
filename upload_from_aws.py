@@ -533,6 +533,7 @@ def map_wash_type_from_rules(
 
     return None
 # ===================== PARSE_FILE =====================
+# ===================== PARSE_FILE =====================
 def parse_file(
     path: Path,
     wash_type_rules: List[Dict[str, Any]],
@@ -561,7 +562,7 @@ def parse_file(
             "wash_package_name": None,
             "wash_type": None,
             "service_id": None,
-            "unlimited_type": None,  # NEW | RECURRING
+            "unlimited_type": None,  # NEW | RECURRING | SIGNUP
             "addons": set(),
             "license_plate": None,
             "customer_name": None,
@@ -611,6 +612,17 @@ def parse_file(
             continue
 
         # =========================================================
+        # UNLIMITED SIGNUP DETECTION (NEW)
+        # =========================================================
+        if (
+            "ClassName=UnlimitedCustomerSignatureViewModel" in content
+            and "MethodName=SubmitSignature" in content
+            and "Message=Unlimited" in content
+        ):
+            sess["unlimited_type"] = "SIGNUP"
+            continue
+
+        # =========================================================
         # COMMON FIELD CAPTURE
         # =========================================================
         m = LICENSE_PLATE_RE.search(content)
@@ -635,7 +647,7 @@ def parse_file(
 
         # =========================================================
         # NEW CUSTOMER → Wash + Add-ons
-        # RULE: first WASH wins, ADDONs never overwrite wash
+        # (unchanged, still works)
         # =========================================================
         if sess["unlimited_type"] == "NEW":
             m = WASH_PKG_RE.search(content)
@@ -653,7 +665,6 @@ def parse_file(
 
                 if rec:
                     if rec["item_kind"] == "WASH":
-                        # Lock the first wash only
                         if not sess["wash_package_id"]:
                             sess["wash_package_id"] = rec["wash_package_id"]
                             sess["wash_package_name"] = rec["wash_package_name"]
@@ -661,7 +672,6 @@ def parse_file(
                     elif rec["item_kind"] == "ADDON":
                         sess["addons"].add(rec["addon_name"])
                 else:
-                    # Fallback to rules ONLY if wash not set yet
                     if not sess["wash_package_id"]:
                         mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
                         if mapped:
@@ -670,8 +680,25 @@ def parse_file(
                             sess["wash_type"] = mapped
 
         # =========================================================
-        # END OF TRANSACTION
-        # Camera image is the most reliable boundary
+        # UNLIMITED SIGNUP → resolve wash_type by wash_package_id
+        # =========================================================
+        if sess["unlimited_type"] == "SIGNUP" and not sess.get("wash_type"):
+            pkg_id = sess.get("wash_package_id")
+            if pkg_id:
+                rec = next(
+                    (
+                        r for r in wash_recurring_map.values()
+                        if int(r.get("wash_package_id", 0)) == int(pkg_id)
+                        and r.get("item_kind") == "WASH"
+                    ),
+                    None,
+                )
+                if rec:
+                    sess["wash_type"] = rec["wash_type"]
+                    sess["wash_package_name"] = rec["wash_package_name"]
+
+        # =========================================================
+        # END OF TRANSACTION (camera = truth)
         # =========================================================
         if (
             "ClassName=AwsModel" in content
@@ -679,7 +706,7 @@ def parse_file(
         ):
             sess["wash_ts_last"] = ts
 
-            # Final safety checks
+            # Final safety checks (unchanged)
             if not sess.get("invoice") or not sess.get("wash_type"):
                 sess = None
                 continue
