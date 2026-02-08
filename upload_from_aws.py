@@ -562,7 +562,7 @@ def parse_file(
             "wash_type": None,
             "service_id": None,
             "unlimited_type": None,   # NEW | RECURRING
-            "_is_unlimited_signup": False,  # INTERNAL ONLY
+            "_is_unlimited_signup": False,
             "addons": set(),
             "license_plate": None,
             "customer_name": None,
@@ -575,13 +575,50 @@ def parse_file(
             "tip_amount": 0.0,
         }
 
+    def commit_session(ts: datetime):
+        nonlocal sess
+
+        if not sess:
+            return
+
+        sess["wash_ts_last"] = ts
+
+        # Safety gate (same as before)
+        if not sess.get("invoice") or not sess.get("wash_type"):
+            sess = None
+            return
+
+        rows.append({
+            "bill": sess["invoice"],
+            "wash_ts_first": sess["wash_ts_first"],
+            "wash_ts_last": sess["wash_ts_last"],
+            "license_plate": sess["license_plate"],
+            "customer_name": sess["customer_name"],
+            "wash_package_id": sess["wash_package_id"],
+            "wash_package_name": sess["wash_package_name"],
+            "wash_type": sess["wash_type"],
+            "payment_type": sess["payment_type"],
+            "image_path": sess["image_path"],
+            "is_unlimited": True,
+            "unlimited_type": sess["unlimited_type"],
+            "addons": ", ".join(sorted(sess["addons"])) or None,
+            "location": location_label,
+            "lane_no": lane_no,
+            "source_file": path.name,
+            "created_on": now_cst_date(),
+            "created_at": now_cst_time(),
+            "invoice_kind": "WASH",
+        })
+
+        sess = None
+
     for raw in lines[start_index:]:
         ts, content = parse_ts(raw.strip())
         if not content or not ts:
             continue
 
         # =========================================================
-        # START OF TRANSACTION (NEW or RECURRING)
+        # START OF TRANSACTION
         # =========================================================
         if (
             "ClassName=RFID Unlimited" in content
@@ -594,7 +631,6 @@ def parse_file(
 
             if "Message=RECURRING" in content:
                 sess["unlimited_type"] = "RECURRING"
-
                 m = SERVICE_ID_RE.search(content)
                 if m:
                     sess["service_id"] = int(m.group(1))
@@ -612,7 +648,7 @@ def parse_file(
             continue
 
         # =========================================================
-        # UNLIMITED SIGNUP DETECTION
+        # SIGNUP DETECTION
         # =========================================================
         if (
             "ClassName=UnlimitedCustomerSignatureViewModel" in content
@@ -656,7 +692,7 @@ def parse_file(
             sess["invoice"] = int(m.group(1))
 
         # =========================================================
-        # NEW CUSTOMER OR SIGNUP → Wash + Add-ons
+        # WASH PACKAGE / ADD-ONS
         # =========================================================
         if sess["unlimited_type"] == "NEW" or sess["_is_unlimited_signup"]:
             m = WASH_PKG_RE.search(content)
@@ -665,86 +701,43 @@ def parse_file(
                 pkg_name = normalize_ws_name(m.group(2))
 
                 rec = next(
-                    (
-                        r for r in wash_recurring_map.values()
-                        if r.get("wash_package_name", "").lower() == pkg_name.lower()
-                    ),
+                    (r for r in wash_recurring_map.values()
+                     if r.get("wash_package_name", "").lower() == pkg_name.lower()),
                     None,
                 )
 
-                if rec:
-                    if rec["item_kind"] == "WASH":
-                        if not sess["wash_package_id"]:
-                            sess["wash_package_id"] = rec["wash_package_id"]
-                            sess["wash_package_name"] = rec["wash_package_name"]
-                            sess["wash_type"] = rec["wash_type"]
-                    elif rec["item_kind"] == "ADDON":
-                        sess["addons"].add(rec["addon_name"])
-                else:
+                if rec and rec["item_kind"] == "WASH":
                     if not sess["wash_package_id"]:
-                        mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
-                        if mapped:
-                            sess["wash_package_id"] = pkg_id
-                            sess["wash_package_name"] = pkg_name
-                            sess["wash_type"] = mapped
+                        sess["wash_package_id"] = rec["wash_package_id"]
+                        sess["wash_package_name"] = rec["wash_package_name"]
+                        sess["wash_type"] = rec["wash_type"]
+                elif not sess["wash_package_id"]:
+                    mapped = map_wash_type_from_rules(pkg_name, wash_type_rules)
+                    if mapped:
+                        sess["wash_package_id"] = pkg_id
+                        sess["wash_package_name"] = pkg_name
+                        sess["wash_type"] = mapped
 
         # =========================================================
-        # SIGNUP → resolve wash_type by wash_package_id
-        # =========================================================
-        if sess["_is_unlimited_signup"] and not sess.get("wash_type"):
-            pkg_id = sess.get("wash_package_id")
-            if pkg_id:
-                rec = next(
-                    (
-                        r for r in wash_recurring_map.values()
-                        if int(r.get("wash_package_id", 0)) == int(pkg_id)
-                        and r.get("item_kind") == "WASH"
-                    ),
-                    None,
-                )
-                if rec:
-                    sess["wash_type"] = rec["wash_type"]
-                    sess["wash_package_name"] = rec["wash_package_name"]
-
-        # =========================================================
-        # END OF TRANSACTION (CAMERA = TRUTH)
-        # 🔴 FIX: extract invoice from camera line if missing
+        # SECONDARY END SIGNAL (CAMERA)
         # =========================================================
         if "SaveIPCameraImageAsync" in content:
-            sess["wash_ts_last"] = ts
-
             if not sess.get("invoice"):
                 m = re.search(r"Invoice(?:ID|Id)\s*(\d+)", content, re.IGNORECASE)
                 if m:
                     sess["invoice"] = int(m.group(1))
+            commit_session(ts)
+            continue
 
-            if not sess.get("invoice") or not sess.get("wash_type"):
-                sess = None
-                continue
-
-            rows.append({
-                "bill": sess["invoice"],
-                "wash_ts_first": sess["wash_ts_first"],
-                "wash_ts_last": sess["wash_ts_last"],
-                "license_plate": sess["license_plate"],
-                "customer_name": sess["customer_name"],
-                "wash_package_id": sess["wash_package_id"],
-                "wash_package_name": sess["wash_package_name"],
-                "wash_type": sess["wash_type"],
-                "payment_type": sess["payment_type"],
-                "image_path": sess["image_path"],
-                "is_unlimited": True,
-                "unlimited_type": sess["unlimited_type"],
-                "addons": ", ".join(sorted(sess["addons"])) or None,
-                "location": location_label,
-                "lane_no": lane_no,
-                "source_file": path.name,
-                "created_on": now_cst_date(),
-                "created_at": now_cst_time(),
-                "invoice_kind": "WASH",
-            })
-
-            sess = None
+        # =========================================================
+        # PRIMARY END SIGNAL (OLD SCRIPT LOGIC)
+        # =========================================================
+        if (
+            "ProceedToCarWashViewModel" in content
+            and "ReturnToMainScreen" in content
+        ):
+            commit_session(ts)
+            continue
 
     return rows
 
