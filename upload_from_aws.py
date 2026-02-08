@@ -612,7 +612,7 @@ def parse_file(
             continue
 
         # =========================================================
-        # UNLIMITED SIGNUP DETECTION (authoritative)
+        # UNLIMITED SIGNUP DETECTION
         # =========================================================
         if (
             "ClassName=UnlimitedCustomerSignatureViewModel" in content
@@ -708,10 +708,15 @@ def parse_file(
 
         # =========================================================
         # END OF TRANSACTION (CAMERA = TRUTH)
-        # Robust matcher (THIS WAS CRITICAL)
+        # 🔴 FIX: extract invoice from camera line if missing
         # =========================================================
-        if "SaveIPCameraImageAsync" in content and "InvoiceId" in content:
+        if "SaveIPCameraImageAsync" in content:
             sess["wash_ts_last"] = ts
+
+            if not sess.get("invoice"):
+                m = re.search(r"Invoice(?:ID|Id)\s*(\d+)", content, re.IGNORECASE)
+                if m:
+                    sess["invoice"] = int(m.group(1))
 
             if not sess.get("invoice") or not sess.get("wash_type"):
                 sess = None
