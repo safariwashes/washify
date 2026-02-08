@@ -561,7 +561,7 @@ def parse_file(
             "wash_package_name": None,
             "wash_type": None,
             "service_id": None,
-            "unlimited_type": None,  # NEW | RECURRING
+            "unlimited_type": None,   # NEW | RECURRING
             "_is_unlimited_signup": False,  # INTERNAL ONLY
             "addons": set(),
             "license_plate": None,
@@ -585,7 +585,8 @@ def parse_file(
         # =========================================================
         if (
             "ClassName=RFID Unlimited" in content
-            and ("MethodName=BindCustomerVehicleInformation" in content or "MethodName=SelectOptionsViewModel" in content)
+            and ("MethodName=BindCustomerVehicleInformation" in content
+                 or "MethodName=SelectOptionsViewModel" in content)
             and ("Message=NEW CUSTOMER" in content or "Message=RECURRING" in content)
         ):
             sess = new_session()
@@ -611,7 +612,7 @@ def parse_file(
             continue
 
         # =========================================================
-        # UNLIMITED SIGNUP DETECTION (AUTHORITATIVE SIGNAL)
+        # UNLIMITED SIGNUP DETECTION (authoritative)
         # =========================================================
         if (
             "ClassName=UnlimitedCustomerSignatureViewModel" in content
@@ -622,15 +623,13 @@ def parse_file(
             continue
 
         # =========================================================
-        # CRITICAL FIX:
-        # Ignore ResetTransaction during Unlimited SIGNUP
+        # IGNORE ResetTransaction DURING SIGNUP
         # =========================================================
         if (
-            sess.get("_is_unlimited_signup")
+            sess["_is_unlimited_signup"]
             and "ClassName=TransactionMethods" in content
             and "MethodName=ResetTransaction" in content
         ):
-            # Signup flow resets UI but wash continues
             continue
 
         # =========================================================
@@ -657,7 +656,7 @@ def parse_file(
             sess["invoice"] = int(m.group(1))
 
         # =========================================================
-        # NEW CUSTOMER OR UNLIMITED SIGNUP → Wash + Add-ons
+        # NEW CUSTOMER OR SIGNUP → Wash + Add-ons
         # =========================================================
         if sess["unlimited_type"] == "NEW" or sess["_is_unlimited_signup"]:
             m = WASH_PKG_RE.search(content)
@@ -690,7 +689,7 @@ def parse_file(
                             sess["wash_type"] = mapped
 
         # =========================================================
-        # UNLIMITED SIGNUP → resolve wash_type by wash_package_id
+        # SIGNUP → resolve wash_type by wash_package_id
         # =========================================================
         if sess["_is_unlimited_signup"] and not sess.get("wash_type"):
             pkg_id = sess.get("wash_package_id")
@@ -708,15 +707,12 @@ def parse_file(
                     sess["wash_package_name"] = rec["wash_package_name"]
 
         # =========================================================
-        # END OF TRANSACTION (camera = truth)
+        # END OF TRANSACTION (CAMERA = TRUTH)
+        # Robust matcher (THIS WAS CRITICAL)
         # =========================================================
-        if (
-            "ClassName=AwsModel" in content
-            and "MethodName=SaveIPCameraImageAsync" in content
-        ):
+        if "SaveIPCameraImageAsync" in content and "InvoiceId" in content:
             sess["wash_ts_last"] = ts
 
-            # Final safety gate (unchanged)
             if not sess.get("invoice") or not sess.get("wash_type"):
                 sess = None
                 continue
