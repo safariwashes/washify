@@ -566,7 +566,7 @@ def parse_file(
             "wash_ts_first": ts,
             "wash_ts_last": None,
             "invoice": None,
-            "license_plate": pending_license_plate,
+            "license_plate": None,
             "customer_name": pending_customer_name,
             "payment_type": None,
             "image_path": None,
@@ -579,6 +579,7 @@ def parse_file(
             "wash_type": None,
             "addons": set(),
             "tip_amount": 0.0,
+            "_seen_tip_pkg_ids": set(),
         }
 
     def finalize(ts):
@@ -590,6 +591,7 @@ def parse_file(
 
         if sess["saw_recurring"]:
             sess["unlimited_type"] = "RECURRING"
+            sess["license_plate"] = None
         elif sess["saw_signup"]:
             sess["unlimited_type"] = "SIGNUP"
         else:
@@ -650,6 +652,8 @@ def parse_file(
         m = LICENSE_PLATE_RE.search(content)
         if m:
             pending_license_plate = m.group(1)
+            if sess and not sess["saw_recurring"]:
+                sess["license_plate"] = pending_license_plate
 
         # START transaction
         if (
@@ -712,10 +716,13 @@ def parse_file(
             # TIP
             tip_m = TIP_RE.search(pkg_name)
             if tip_m:
-                try:
-                    sess["tip_amount"] += float(tip_m.group(1))
-                except Exception:
-                    pass
+                # only count tip ONCE per transaction
+                if pkg_id not in sess["_seen_tip_pkg_ids"]:
+                    try:
+                        sess["tip_amount"] += float(tip_m.group(1))
+                        sess["_seen_tip_pkg_ids"].add(pkg_id)
+                    except Exception:
+                        pass
                 continue
 
             # 🔑 ALWAYS trust package_id
