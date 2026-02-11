@@ -1170,7 +1170,7 @@ def main():
         for local_path, source_hint in file_entries:
             if local_path is None:
                 key = source_hint
-                filename = os.path.basename(key)
+                filename = key
             else:
                 key = None
                 filename = local_path.name
