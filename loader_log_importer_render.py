@@ -36,7 +36,7 @@ DB_PARAMS = dict(
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 # =========================================================
-# DB CONNECTION (with recovery retry)
+# DB CONNECTION (recovery-safe)
 # =========================================================
 def get_conn_with_retry(retries=3, delay=5):
     for i in range(retries):
@@ -55,7 +55,7 @@ def get_conn_with_retry(retries=3, delay=5):
 def parse_s3_context(key: str):
     """
     Expected S3 layout:
-      loader/tenant=<tenant_slug>/address=<address_slug>/...
+      loader/tenant=<tenant_slug>/address=<address_slug>/filename.txt
     """
     m = re.search(r"tenant=([^/]+)/address=([^/]+)/", key)
     if not m:
@@ -70,23 +70,20 @@ def parse_ts(ts: str):
         return None
 
 
-def resolve_tenant_id(cur, tenant_alias):
-    canonical_slug = TENANT_ALIAS_MAP.get(tenant_alias)
-    if not canonical_slug:
-        raise ValueError(f"Unknown tenant alias: {tenant_alias}")
-
+def resolve_tenant_id(cur, tenant_slug):
     cur.execute(
         "SELECT tenant_id FROM tenants WHERE tenant_slug = %s",
-        (canonical_slug,),
+        (tenant_slug,),
     )
     row = cur.fetchone()
     if not row:
-        raise ValueError(f"Tenant not found for slug={canonical_slug}")
+        raise ValueError(f"Tenant not found for slug={tenant_slug}")
     return row[0]
+
 
 def resolve_location(cur, tenant_id, address_slug):
     """
-    Match S3 address slug to locations.address
+    Match slugified S3 address to locations.address
     """
     cur.execute(
         """
@@ -158,10 +155,7 @@ def process_controller_log(cur, tenant_id, location_code, key, lines):
         try:
             ts_raw, rest = line.split(",", 1)
             log_ts = parse_ts(ts_raw)
-            if not log_ts:
-                continue
-
-            if last_ts and log_ts <= last_ts:
+            if not log_ts or (last_ts and log_ts <= last_ts):
                 continue
 
             m = re.search(r"Invoice Id (\d+)", rest)
@@ -185,14 +179,7 @@ def process_controller_log(cur, tenant_id, location_code, key, lines):
                 VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 """,
-                (
-                    tenant_id,
-                    location_code,
-                    log_ts,
-                    event_type,
-                    invoice_id,
-                    key,
-                ),
+                (tenant_id, location_code, log_ts, event_type, invoice_id, key),
             )
 
             if not max_ts or log_ts > max_ts:
@@ -216,10 +203,7 @@ def process_transaction_log(cur, tenant_id, location_code, key, lines):
         try:
             ts_raw, rest = line.split(",", 1)
             log_ts = parse_ts(ts_raw)
-            if not log_ts:
-                continue
-
-            if last_ts and log_ts <= last_ts:
+            if not log_ts or (last_ts and log_ts <= last_ts):
                 continue
 
             cls = re.search(r"Class=([^,]+)", rest)
@@ -270,7 +254,6 @@ def main():
 
         for obj in resp.get("Contents", []):
             key = obj["Key"]
-
             if not key.lower().endswith(".txt"):
                 continue
 
@@ -290,15 +273,11 @@ def main():
 
                 if "controllerlog" in key.lower():
                     log.info(f"📄 ControllerLog → {key}")
-                    process_controller_log(
-                        cur, tenant_id, location_code, key, lines
-                    )
+                    process_controller_log(cur, tenant_id, location_code, key, lines)
 
                 elif "transactionlog" in key.lower():
                     log.info(f"📄 TransactionLog → {key}")
-                    process_transaction_log(
-                        cur, tenant_id, location_code, key, lines
-                    )
+                    process_transaction_log(cur, tenant_id, location_code, key, lines)
 
                 write_heartbeat(cur, tenant_id, location_id)
                 conn.commit()
@@ -321,4 +300,3 @@ if __name__ == "__main__":
             log.error("DB in recovery mode — exiting, will retry next run")
             sys.exit(2)
         raise
-
