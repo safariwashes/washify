@@ -63,23 +63,23 @@ def parse_ts(ts: str):
 
 def resolve_location(cur, tenant_id, address_slug):
     """
-    Resolve both location_id (UUID) and location_code (FRA/NSH/etc)
+    Resolve location_id + location_code by slug-matching locations.address
     """
     cur.execute(
         """
-        SELECT location_id, location
-          FROM tenant_location
+        SELECT location_id, location_code
+          FROM locations
          WHERE tenant_id = %s
-           AND address_slug = %s
+           AND lower(regexp_replace(address, '[^a-z0-9]+', '-', 'g')) = %s
         """,
-        (tenant_id, address_slug),
+        (tenant_id, address_slug.lower()),
     )
     row = cur.fetchone()
     if not row:
         raise ValueError(
-            f"Location not found for tenant={tenant_id}, address={address_slug}"
+            f"Location not found for tenant={tenant_id}, address_slug={address_slug}"
         )
-    return row[0], row[1]  # (location_id, location_code)
+    return row[0], row[1]  # location_id, location_code
 
 
 def get_checkpoint(cur, tenant_id, location_code, file_type):
