@@ -316,6 +316,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        log.critical(f"🔥 Fatal error: {e}")
-        sys.exit(1)
+    except psycopg2.OperationalError as e:
+        if "recovery mode" in str(e).lower():
+            log.error("DB in recovery mode — exiting, will retry next run")
+            sys.exit(2)
+        raise
+
