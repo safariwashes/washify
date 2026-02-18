@@ -1,244 +1,292 @@
 import os
+import re
+import sys
+import logging
 import boto3
 import psycopg2
-import re
-from datetime import date, timedelta
-import sys
+from datetime import datetime
 
-# ---------- Environment Variables ----------
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD") or os.getenv("DB_PASS")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT", "5432")
+# =========================================================
+# LOGGING
+# =========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("loader-sequential")
 
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+# =========================================================
+# CONFIG
+# =========================================================
 S3_BUCKET = "safari-franklin-data"
+S3_PREFIX = "loader/"
+AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
 
-# ---------- AWS & DB Setup ----------
-s3 = boto3.client(
-    "s3",
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
+SOURCE_NAME = "LoaderSequentialIngest"
+
+DB_PARAMS = dict(
+    dbname=os.getenv("DB_NAME"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD"),
+    host=os.getenv("DB_HOST"),
+    port=os.getenv("DB_PORT", "5432"),
 )
 
-def connect_db():
-    return psycopg2.connect(
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        host=DB_HOST,
-        port=DB_PORT
+s3 = boto3.client("s3", region_name=AWS_REGION)
+
+# =========================================================
+# DB
+# =========================================================
+def get_conn():
+    return psycopg2.connect(**DB_PARAMS)
+
+# =========================================================
+# HELPERS
+# =========================================================
+def parse_s3_context(key: str):
+    """
+    Expected S3 layout:
+      loader/tenant=<tenant_uuid>/location=<CODE>/...
+    """
+    m = re.search(r"tenant=([^/]+)/location=([^/]+)/", key)
+    if not m:
+        raise ValueError(f"Invalid S3 key (missing tenant/location): {key}")
+    return m.group(1), m.group(2)
+
+
+def parse_ts(ts: str):
+    try:
+        return datetime.strptime(ts.strip(), "%m/%d/%Y %I:%M:%S %p")
+    except Exception:
+        return None
+
+
+def resolve_location_id(cur, tenant_id, location_code):
+    cur.execute(
+        """
+        SELECT location_id
+          FROM tenant_location
+         WHERE tenant_id = %s
+           AND location = %s
+        """,
+        (tenant_id, location_code),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(
+            f"Location not found for tenant={tenant_id}, location={location_code}"
+        )
+    return row[0]
+
+
+def get_checkpoint(cur, tenant_id, location_code, file_type):
+    cur.execute(
+        """
+        SELECT last_log_ts
+          FROM loader_file_checkpoint
+         WHERE tenant_id = %s
+           AND location_code = %s
+           AND file_type = %s
+        """,
+        (tenant_id, location_code, file_type),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def save_checkpoint(cur, tenant_id, location_code, file_type, ts):
+    cur.execute(
+        """
+        INSERT INTO loader_file_checkpoint
+            (tenant_id, location_code, file_type, last_log_ts)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (tenant_id, location_code, file_type)
+        DO UPDATE
+           SET last_log_ts = EXCLUDED.last_log_ts,
+               updated_at = now()
+        """,
+        (tenant_id, location_code, file_type, ts),
     )
 
-# ------------------------------------------------------------
-#   Time normalization helper (fixes 01:27:48 / 1:27:48 AM)
-# ------------------------------------------------------------
-def normalize_time(t):
-    t = t.strip()
-    t = t.replace("AM", "").replace("PM", "").strip()
 
-    parts = t.split(":")
-    if len(parts) != 3:
-        return None
+def write_heartbeat(cur, tenant_id, location_id):
+    cur.execute(
+        """
+        INSERT INTO heartbeat (source, tenant_id, location_id)
+        VALUES (%s, %s, %s)
+        """,
+        (SOURCE_NAME, tenant_id, location_id),
+    )
 
-    hh, mm, ss = parts
+# =========================================================
+# PARSERS
+# =========================================================
+def process_controller_log(cur, tenant_id, location_code, key, lines):
+    last_ts = get_checkpoint(cur, tenant_id, location_code, "CONTROLLER")
+    max_ts = last_ts
 
-    # Add zero padding
-    try:
-        hh = f"{int(hh):02d}"
-        mm = f"{int(mm):02d}"
-        ss = f"{int(ss):02d}"
-        return f"{hh}:{mm}:{ss}"
-    except:
-        return None
-
-# ------------------------------------------------------------
-#   NEW: fetch last processed bill (for tail-seek)
-# ------------------------------------------------------------
-def get_last_processed_bill(cursor):
-    cursor.execute("""
-        SELECT bill, log_dt, log_time 
-          FROM loader_log
-      ORDER BY log_dt DESC, log_time DESC
-         LIMIT 1;
-    """)
-    result = cursor.fetchone()
-    if result:
-        bill, log_dt, log_time = result
-        print(f"🧭 Last processed bill: {bill} at {log_dt} {log_time}")
-        return bill
-    else:
-        print("🧭 No previous bills, processing full file.")
-        return None
-
-
-# ------------------------------------------------------------
-#   Process folder (optimized)
-# ------------------------------------------------------------
-def process_folder(conn, cursor, folder):
-    prefix = f"loader1/{folder}/"
-    print(f"🔍 Checking folder: {prefix}")
-    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-
-    if "Contents" not in response:
-        print(f"No files in {prefix}")
-        return
-
-    last_bill = get_last_processed_bill(cursor)
-
-    for obj in response["Contents"]:
-        key = obj["Key"]
-        if not key.lower().endswith(".txt"):
+    for line in lines:
+        if "Invoice Id" not in line:
             continue
 
-        print(f"📄 Detected file: {key}")
+        try:
+            ts_raw, rest = line.split(",", 1)
+            log_ts = parse_ts(ts_raw)
+            if not log_ts:
+                continue
 
-        # Load file
-        body = s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8", errors="ignore")
-        lines = [l.strip() for l in body.splitlines() if l.strip()]
+            if last_ts and log_ts <= last_ts:
+                continue
 
-        # -------------------------------------
-        # SEEK to location of last processed bill
-        # -------------------------------------
-        start_index = 0
-        if last_bill:
-            pattern = f"Invoice Id {last_bill}"
-            for idx in range(len(lines) - 1, -1, -1):
-                if pattern in lines[idx]:
-                    start_index = idx - (idx % 4)
-                    print(f"⏩ Starting at block index {start_index} (after last bill {last_bill})")
-                    break
+            m = re.search(r"Invoice Id (\d+)", rest)
+            if not m:
+                continue
+
+            invoice_id = int(m.group(1))
+
+            if "RTC True" in rest:
+                event_type = "RTC_TRUE"
+            elif "CallRTCControllerByCode" in rest:
+                event_type = "CALL_CONTROLLER"
             else:
-                print("⚠️ Last bill not found in file, processing full file.")
+                continue
 
-        inserted_count = 0
-        i = start_index
+            cur.execute(
+                """
+                INSERT INTO loader_controller_log
+                    (tenant_id, location_code, log_ts,
+                     event_type, invoice_id, source_file)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    tenant_id,
+                    location_code,
+                    log_ts,
+                    event_type,
+                    invoice_id,
+                    key,
+                ),
+            )
 
-        # -------------------------------------
-        # BLOCK-BY-BLOCK PROCESSING
-        # -------------------------------------
-        while i < len(lines):
+            if not max_ts or log_ts > max_ts:
+                max_ts = log_ts
+
+        except Exception as e:
+            log.warning(f"ControllerLog skipped line: {e}")
+
+    if max_ts and max_ts != last_ts:
+        save_checkpoint(cur, tenant_id, location_code, "CONTROLLER", max_ts)
+
+
+def process_transaction_log(cur, tenant_id, location_code, key, lines):
+    last_ts = get_checkpoint(cur, tenant_id, location_code, "TRANSACTION")
+    max_ts = last_ts
+
+    for line in lines:
+        if not line.strip():
+            continue
+
+        try:
+            ts_raw, rest = line.split(",", 1)
+            log_ts = parse_ts(ts_raw)
+            if not log_ts:
+                continue
+
+            if last_ts and log_ts <= last_ts:
+                continue
+
+            cls = re.search(r"Class=([^,]+)", rest)
+            mth = re.search(r"Method=([^,]+)", rest)
+            msg = re.search(r"Message=(.*)", rest)
+            inv = re.search(r"InvoiceId (\d+)", rest)
+
+            cur.execute(
+                """
+                INSERT INTO loader_transaction_log
+                    (tenant_id, location_code, log_ts,
+                     class_name, method_name, message,
+                     invoice_id, source_file)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    tenant_id,
+                    location_code,
+                    log_ts,
+                    cls.group(1) if cls else None,
+                    mth.group(1) if mth else None,
+                    msg.group(1) if msg else None,
+                    int(inv.group(1)) if inv else None,
+                    key,
+                ),
+            )
+
+            if not max_ts or log_ts > max_ts:
+                max_ts = log_ts
+
+        except Exception as e:
+            log.warning(f"TransactionLog skipped line: {e}")
+
+    if max_ts and max_ts != last_ts:
+        save_checkpoint(cur, tenant_id, location_code, "TRANSACTION", max_ts)
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    log.info("🚀 Loader sequential ingestion started")
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PREFIX)
+
+        for obj in resp.get("Contents", []):
+            key = obj["Key"]
+
+            if not key.lower().endswith(".txt"):
+                continue
+
             try:
-                line1 = lines[i]
-                line2 = lines[i + 1]
-                line4 = lines[i + 3]
+                tenant_id, location_code = parse_s3_context(key)
+                location_id = resolve_location_id(cur, tenant_id, location_code)
 
-                # Extract timestamp
-                ts_match = re.match(r"^([^,]+)", line1)
-                timestamp_raw = ts_match.group(1).strip() if ts_match else ""
+                body = (
+                    s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"]
+                    .read()
+                    .decode("utf-8", errors="ignore")
+                )
+                lines = body.splitlines()
 
-                parts = timestamp_raw.split(" ", 1)
-                if len(parts) != 2:
-                    raise Exception(f"Bad timestamp: {timestamp_raw}")
+                if "controllerlog" in key.lower():
+                    log.info(f"📄 ControllerLog → {key}")
+                    process_controller_log(
+                        cur, tenant_id, location_code, key, lines
+                    )
 
-                date_part, time_raw = parts
-                time_norm = normalize_time(time_raw)
+                elif "transactionlog" in key.lower():
+                    log.info(f"📄 TransactionLog → {key}")
+                    process_transaction_log(
+                        cur, tenant_id, location_code, key, lines
+                    )
 
-                if not time_norm:
-                    raise Exception(f"Unparseable time: {time_raw}")
-
-                # FULL TIMESTAMP FOR DB (fixes all Postgres errors)
-                prep_end_ts = f"{date_part} {time_norm}"
-
-                # Extract bills
-                bill = int(re.search(r"Invoice Id (\d+)", line2).group(1))
-                washify_rec = int(re.search(r"Invoice Id (\d+)", line4).group(1))
-
-                # Check duplicate
-                cursor.execute("SELECT 1 FROM loader_log WHERE bill = %s", (bill,))
-                exists = cursor.fetchone()
-
-                # Insert into loader_log
-                if not exists:
-                    cursor.execute("""
-                        INSERT INTO loader_log (bill, washify_rec, log_dt, log_time)
-                        VALUES (%s, %s, %s, %s)
-                    """, (bill, washify_rec, date_part, time_norm))
-                    conn.commit()
-                    inserted_count += 1
-                    print(f"🆕 Inserted bill={bill}")
-                else:
-                    print(f"↻ Bill {bill} already exists")
-
-                # Update SUPER
-                cursor.execute("""
-                    UPDATE super
-                       SET status = 3,
-                           prep_end = %s,
-                           status_desc = 'Wash'
-                     WHERE bill = %s
-                       AND created_on = %s
-                       AND location = 'FRA'
-                       AND (status IS NULL OR status < 3)
-                """, (prep_end_ts, bill, date_part))
-                if cursor.rowcount > 0:
-                    print(f"🧾 SUPER updated for bill={bill}")
-                conn.commit()
-
-                # Update TUNNEL
-                cursor.execute("""
-                    UPDATE tunnel
-                       SET load = TRUE,
-                           load_time = %s
-                     WHERE bill = %s
-                       AND created_on = %s
-                       AND location = 'FRA'
-                """, (prep_end_ts, bill, date_part))
-                if cursor.rowcount > 0:
-                    print(f"🚗 TUNNEL updated for bill={bill}")
+                write_heartbeat(cur, tenant_id, location_id)
                 conn.commit()
 
             except Exception as e:
-                print(f"❌ Error parsing block {i}: {e}")
                 conn.rollback()
+                log.error(f"❌ Failed processing {key}: {e}")
 
-            i += 4
-
-        print(f"✅ File processed: {key}, {inserted_count} new records.\n")
-
-        # Delete file after successful processing
-        try:
-            s3.delete_object(Bucket=S3_BUCKET, Key=key)
-            print(f"🧹 Deleted S3 file: {key}")
-        except Exception as e:
-            print(f"⚠️ Failed to delete file {key}: {e}")
-
-
-# ------------------------------------------------------------
-#   MAIN RUNNER
-# ------------------------------------------------------------
-def process_files():
-    conn = connect_db()
-    cursor = conn.cursor()
-
-    today_folder = date.today().strftime("%Y-%m-%d")
-    yesterday_folder = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    for folder in [today_folder, yesterday_folder]:
-        process_folder(conn, cursor, folder)
-
-    # Heartbeat
-    try:
-        cursor.execute("""
-            INSERT INTO heartbeat (source, created_on, created_at)
-            VALUES (%s, CURRENT_DATE, CURRENT_TIME)
-        """, ("Loader2Safari",))
-        conn.commit()
-        print("💓 Heartbeat logged: Loader2Safari")
-    except Exception as e:
-        print(f"⚠️ Heartbeat logging failed: {e}")
-
-    cursor.close()
-    conn.close()
+    finally:
+        cur.close()
+        conn.close()
+        log.info("✅ Loader sequential ingestion completed")
 
 
 if __name__ == "__main__":
-    print("🚀 Loader2Safari single-run mode started...")
     try:
-        process_files()
+        main()
     except Exception as e:
-        print(f"⚠️ Unexpected error: {e}")
+        log.critical(f"🔥 Fatal error: {e}")
+        sys.exit(1)
