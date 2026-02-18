@@ -36,41 +36,9 @@ DB_PARAMS = dict(
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 # =========================================================
-# DB CONNECTION (recovery-safe)
+# DB CONNECTION (production-grade retry)
 # =========================================================
-def get_conn_with_retry(retries=3, delay=5):
-    for i in range(retries):
-        try:
-            return psycopg2.connect(**DB_PARAMS)
-        except psycopg2.OperationalError as e:
-            if "recovery mode" in str(e).lower() and i < retries - 1:
-                log.warning("DB in recovery mode, retrying...")
-                time.sleep(delay)
-            else:
-                raise
-
-# =========================================================
-# HELPERS
-# =========================================================
-def parse_s3_context(key: str):
-    """
-    Expected S3 layout:
-      loader/tenant=<tenant_slug>/address=<address_slug>/filename.txt
-    """
-    m = re.search(r"tenant=([^/]+)/address=([^/]+)/", key)
-    if not m:
-        raise ValueError(f"Invalid S3 key (missing tenant/address): {key}")
-    return m.group(1), m.group(2)
-
-
-def parse_ts(ts: str):
-    try:
-        return datetime.strptime(ts.strip(), "%m/%d/%Y %I:%M:%S %p")
-    except Exception:
-        return None
-
-
-def get_conn_with_retry(retries=6, delay=5):
+def get_conn_with_retry(retries: int = 6, delay: int = 5):
     """
     Robust Postgres connection retry.
     Handles recovery, restart, and transient Render outages.
@@ -94,21 +62,67 @@ def get_conn_with_retry(retries=6, delay=5):
             )
 
             if transient and attempt < retries:
-                log.warning(
-                    f"DB unavailable (attempt {attempt}/{retries}), retrying in {delay}s"
-                )
+                log.warning(f"DB unavailable (attempt {attempt}/{retries}), retrying in {delay}s")
                 time.sleep(delay)
                 continue
 
-            # Non-transient or retries exhausted
             raise
 
-    # Should never reach here, but be explicit
     raise last_err
 
 
+# =========================================================
+# HELPERS
+# =========================================================
+def parse_s3_context(key: str):
+    """
+    Expected S3 layout:
+      loader/tenant=<tenant_token>/address=<address_slug>/filename.txt
+    """
+    m = re.search(r"tenant=([^/]+)/address=([^/]+)/", key)
+    if not m:
+        raise ValueError(f"Invalid S3 key (missing tenant/address): {key}")
+    return m.group(1), m.group(2)
 
-def resolve_location(cur, tenant_id, address_slug):
+
+def parse_ts(ts: str):
+    try:
+        return datetime.strptime(ts.strip(), "%m/%d/%Y %I:%M:%S %p")
+    except Exception:
+        return None
+
+
+def resolve_tenant_id(cur, tenant_token: str):
+    """
+    Resolve tenant_id from S3 tenant token (e.g. 'safariexpresswash') without:
+      - tenant_alias table
+      - hardcoding tenant_id
+
+    Strategy:
+      - Normalize both token + tenant_slug to alnum-only
+      - Choose the most specific tenant_slug that matches as a prefix
+    """
+    token_norm = re.sub(r"[^a-z0-9]+", "", (tenant_token or "").lower()).strip()
+    if not token_norm:
+        raise ValueError(f"Bad tenant token: {tenant_token!r}")
+
+    cur.execute(
+        """
+        SELECT tenant_id, tenant_slug
+          FROM tenants
+         WHERE %s LIKE regexp_replace(lower(tenant_slug), '[^a-z0-9]+', '', 'g') || '%'
+         ORDER BY length(tenant_slug) DESC
+         LIMIT 1
+        """,
+        (token_norm,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"Tenant not found for token={tenant_token}")
+    return row[0]
+
+
+def resolve_location(cur, tenant_id, address_slug: str):
     """
     Match slugified S3 address to locations.address
     """
@@ -119,7 +133,7 @@ def resolve_location(cur, tenant_id, address_slug):
          WHERE tenant_id = %s
            AND lower(regexp_replace(address, '[^a-z0-9]+', '-', 'g')) = %s
         """,
-        (tenant_id, address_slug.lower()),
+        (tenant_id, (address_slug or "").lower()),
     )
     row = cur.fetchone()
     if not row:
@@ -167,6 +181,7 @@ def write_heartbeat(cur, tenant_id, location_id):
         """,
         (SOURCE_NAME, tenant_id, location_id),
     )
+
 
 # =========================================================
 # PARSERS
@@ -267,6 +282,7 @@ def process_transaction_log(cur, tenant_id, location_code, key, lines):
     if max_ts and max_ts != last_ts:
         save_checkpoint(cur, tenant_id, location_code, "TRANSACTION", max_ts)
 
+
 # =========================================================
 # MAIN
 # =========================================================
@@ -284,12 +300,15 @@ def main():
             if not key.lower().endswith(".txt"):
                 continue
 
+            # Optional guard: only process known file types
+            k = key.lower()
+            if ("controllerlog" not in k) and ("transactionlog" not in k):
+                continue
+
             try:
-                tenant_slug, address_slug = parse_s3_context(key)
-                tenant_id = resolve_tenant_id(cur, tenant_slug)
-                location_id, location_code = resolve_location(
-                    cur, tenant_id, address_slug
-                )
+                tenant_token, address_slug = parse_s3_context(key)
+                tenant_id = resolve_tenant_id(cur, tenant_token)
+                location_id, location_code = resolve_location(cur, tenant_id, address_slug)
 
                 body = (
                     s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"]
@@ -298,11 +317,11 @@ def main():
                 )
                 lines = body.splitlines()
 
-                if "controllerlog" in key.lower():
+                if "controllerlog" in k:
                     log.info(f"📄 ControllerLog → {key}")
                     process_controller_log(cur, tenant_id, location_code, key, lines)
 
-                elif "transactionlog" in key.lower():
+                elif "transactionlog" in k:
                     log.info(f"📄 TransactionLog → {key}")
                     process_transaction_log(cur, tenant_id, location_code, key, lines)
 
@@ -314,8 +333,14 @@ def main():
                 log.error(f"❌ Failed processing {key}: {e}")
 
     finally:
-        cur.close()
-        conn.close()
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
         log.info("✅ Loader sequential ingestion completed")
 
 
@@ -323,7 +348,8 @@ if __name__ == "__main__":
     try:
         main()
     except psycopg2.OperationalError as e:
-        if "recovery mode" in str(e).lower():
-            log.error("DB in recovery mode — exiting, will retry next run")
+        msg = str(e).lower()
+        if "recovery mode" in msg or "not yet accepting connections" in msg:
+            log.error("DB unavailable — exiting, will retry next run")
             sys.exit(2)
         raise
