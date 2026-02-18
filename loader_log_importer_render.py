@@ -70,14 +70,25 @@ def parse_ts(ts: str):
         return None
 
 
-def resolve_tenant_id(cur, tenant_slug):
+def resolve_tenant_id(cur, tenant_token):
+    """
+    Resolve tenant using normalized comparison.
+    Does NOT require tenant_alias table.
+    """
+
+    norm = re.sub(r"[^a-z0-9]+", "", tenant_token.lower())
+
     cur.execute(
-        "SELECT tenant_id FROM tenants WHERE tenant_slug = %s",
-        (tenant_slug,),
+        """
+        SELECT tenant_id
+          FROM tenants
+         WHERE regexp_replace(lower(tenant_slug), '[^a-z0-9]+', '', 'g') = %s
+        """,
+        (norm,),
     )
     row = cur.fetchone()
     if not row:
-        raise ValueError(f"Tenant not found for slug={tenant_slug}")
+        raise ValueError(f"Tenant not found for token={tenant_token}")
     return row[0]
 
 
