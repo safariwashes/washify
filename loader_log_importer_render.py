@@ -70,32 +70,42 @@ def parse_ts(ts: str):
         return None
 
 
-def resolve_tenant_id(cur, tenant_token):
+def get_conn_with_retry(retries=6, delay=5):
     """
-    Resolve tenant from S3 token like:
-      safariexpresswash
-    against tenants.tenant_slug
+    Robust Postgres connection retry.
+    Handles recovery, restart, and transient Render outages.
     """
+    last_err = None
 
-    token = re.sub(r"[^a-z0-9]+", "", tenant_token.lower())
+    for attempt in range(1, retries + 1):
+        try:
+            return psycopg2.connect(**DB_PARAMS)
 
-    cur.execute(
-        """
-        SELECT tenant_id
-          FROM tenants
-         WHERE regexp_replace(lower(%s), '[^a-z0-9]+', '', 'g')
-               LIKE regexp_replace(lower(tenant_slug), '[^a-z0-9]+', '', 'g') || '%'
-         ORDER BY length(tenant_slug) DESC
-         LIMIT 1
-        """,
-        (token,),
-    )
+        except psycopg2.OperationalError as e:
+            msg = str(e).lower()
+            last_err = e
 
-    row = cur.fetchone()
-    if not row:
-        raise ValueError(f"Tenant not found for token={tenant_token}")
+            transient = (
+                "recovery mode" in msg
+                or "not yet accepting connections" in msg
+                or "terminating connection" in msg
+                or "connection refused" in msg
+                or "could not connect to server" in msg
+            )
 
-    return row[0]
+            if transient and attempt < retries:
+                log.warning(
+                    f"DB unavailable (attempt {attempt}/{retries}), retrying in {delay}s"
+                )
+                time.sleep(delay)
+                continue
+
+            # Non-transient or retries exhausted
+            raise
+
+    # Should never reach here, but be explicit
+    raise last_err
+
 
 
 def resolve_location(cur, tenant_id, address_slug):
