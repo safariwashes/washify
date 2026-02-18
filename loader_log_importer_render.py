@@ -72,23 +72,31 @@ def parse_ts(ts: str):
 
 def resolve_tenant_id(cur, tenant_token):
     """
-    Resolve tenant using normalized comparison.
-    Does NOT require tenant_alias table.
+    Resolve tenant from S3 token like:
+      safariexpresswash
+    against tenants.tenant_slug like:
+      safari
+      safari-express
+      safari-express-wash
     """
 
-    norm = re.sub(r"[^a-z0-9]+", "", tenant_token.lower())
+    token = tenant_token.lower()
 
     cur.execute(
         """
         SELECT tenant_id
           FROM tenants
-         WHERE regexp_replace(lower(tenant_slug), '[^a-z0-9]+', '', 'g') = %s
+         WHERE %s LIKE regexp_replace(lower(tenant_slug), '[^a-z0-9]+', '', 'g') || '%'
+         ORDER BY length(tenant_slug) DESC
+         LIMIT 1
         """,
-        (norm,),
+        (token,),
     )
+
     row = cur.fetchone()
     if not row:
         raise ValueError(f"Tenant not found for token={tenant_token}")
+
     return row[0]
 
 
