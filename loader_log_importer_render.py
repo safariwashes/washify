@@ -74,19 +74,17 @@ def resolve_tenant_id(cur, tenant_token):
     """
     Resolve tenant from S3 token like:
       safariexpresswash
-    against tenants.tenant_slug like:
-      safari
-      safari-express
-      safari-express-wash
+    against tenants.tenant_slug
     """
 
-    token = tenant_token.lower()
+    token = re.sub(r"[^a-z0-9]+", "", tenant_token.lower())
 
     cur.execute(
         """
         SELECT tenant_id
           FROM tenants
-         WHERE %s LIKE regexp_replace(lower(tenant_slug), '[^a-z0-9]+', '', 'g') || '%'
+         WHERE regexp_replace(lower(%s), '[^a-z0-9]+', '', 'g')
+               LIKE regexp_replace(lower(tenant_slug), '[^a-z0-9]+', '', 'g') || '%'
          ORDER BY length(tenant_slug) DESC
          LIMIT 1
         """,
