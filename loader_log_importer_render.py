@@ -70,20 +70,19 @@ def parse_ts(ts: str):
         return None
 
 
-def resolve_tenant_id(cur, tenant_slug):
+def resolve_tenant_id(cur, tenant_alias):
+    canonical_slug = TENANT_ALIAS_MAP.get(tenant_alias)
+    if not canonical_slug:
+        raise ValueError(f"Unknown tenant alias: {tenant_alias}")
+
     cur.execute(
-        """
-        SELECT tenant_id
-          FROM tenants
-         WHERE tenant_slug = %s
-        """,
-        (tenant_slug,),
+        "SELECT tenant_id FROM tenants WHERE tenant_slug = %s",
+        (canonical_slug,),
     )
     row = cur.fetchone()
     if not row:
-        raise ValueError(f"Tenant not found for slug={tenant_slug}")
+        raise ValueError(f"Tenant not found for slug={canonical_slug}")
     return row[0]
-
 
 def resolve_location(cur, tenant_id, address_slug):
     """
