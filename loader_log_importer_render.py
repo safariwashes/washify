@@ -46,11 +46,11 @@ def get_conn():
 def parse_s3_context(key: str):
     """
     Expected S3 layout:
-      loader/tenant=<tenant_uuid>/location=<CODE>/...
+      loader/tenant=<tenant_slug>/address=<address_slug>/...
     """
-    m = re.search(r"tenant=([^/]+)/location=([^/]+)/", key)
+    m = re.search(r"tenant=([^/]+)/address=([^/]+)/", key)
     if not m:
-        raise ValueError(f"Invalid S3 key (missing tenant/location): {key}")
+        raise ValueError(f"Invalid S3 key (missing tenant/address): {key}")
     return m.group(1), m.group(2)
 
 
@@ -61,22 +61,25 @@ def parse_ts(ts: str):
         return None
 
 
-def resolve_location_id(cur, tenant_id, location_code):
+def resolve_location(cur, tenant_id, address_slug):
+    """
+    Resolve both location_id (UUID) and location_code (FRA/NSH/etc)
+    """
     cur.execute(
         """
-        SELECT location_id
+        SELECT location_id, location
           FROM tenant_location
          WHERE tenant_id = %s
-           AND location = %s
+           AND address_slug = %s
         """,
-        (tenant_id, location_code),
+        (tenant_id, address_slug),
     )
     row = cur.fetchone()
     if not row:
         raise ValueError(
-            f"Location not found for tenant={tenant_id}, location={location_code}"
+            f"Location not found for tenant={tenant_id}, address={address_slug}"
         )
-    return row[0]
+    return row[0], row[1]  # (location_id, location_code)
 
 
 def get_checkpoint(cur, tenant_id, location_code, file_type):
@@ -249,8 +252,10 @@ def main():
                 continue
 
             try:
-                tenant_id, location_code = parse_s3_context(key)
-                location_id = resolve_location_id(cur, tenant_id, location_code)
+                tenant_id, address_slug = parse_s3_context(key)
+                location_id, location_code = resolve_location(
+                    cur, tenant_id, address_slug
+                )
 
                 body = (
                     s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"]
