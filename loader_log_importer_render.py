@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import logging
 import boto3
 import psycopg2
@@ -35,10 +36,18 @@ DB_PARAMS = dict(
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 # =========================================================
-# DB
+# DB CONNECTION (with recovery retry)
 # =========================================================
-def get_conn():
-    return psycopg2.connect(**DB_PARAMS)
+def get_conn_with_retry(retries=3, delay=5):
+    for i in range(retries):
+        try:
+            return psycopg2.connect(**DB_PARAMS)
+        except psycopg2.OperationalError as e:
+            if "recovery mode" in str(e).lower() and i < retries - 1:
+                log.warning("DB in recovery mode, retrying...")
+                time.sleep(delay)
+            else:
+                raise
 
 # =========================================================
 # HELPERS
@@ -61,9 +70,24 @@ def parse_ts(ts: str):
         return None
 
 
+def resolve_tenant_id(cur, tenant_slug):
+    cur.execute(
+        """
+        SELECT tenant_id
+          FROM tenants
+         WHERE tenant_slug = %s
+        """,
+        (tenant_slug,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"Tenant not found for slug={tenant_slug}")
+    return row[0]
+
+
 def resolve_location(cur, tenant_id, address_slug):
     """
-    Resolve location_id + location_code by slug-matching locations.address
+    Match S3 address slug to locations.address
     """
     cur.execute(
         """
@@ -77,9 +101,9 @@ def resolve_location(cur, tenant_id, address_slug):
     row = cur.fetchone()
     if not row:
         raise ValueError(
-            f"Location not found for tenant={tenant_id}, address_slug={address_slug}"
+            f"Location not found for tenant_id={tenant_id}, address_slug={address_slug}"
         )
-    return row[0], row[1]  # location_id, location_code
+    return row[0], row[1]
 
 
 def get_checkpoint(cur, tenant_id, location_code, file_type):
@@ -239,7 +263,7 @@ def process_transaction_log(cur, tenant_id, location_code, key, lines):
 def main():
     log.info("🚀 Loader sequential ingestion started")
 
-    conn = get_conn()
+    conn = get_conn_with_retry()
     cur = conn.cursor()
 
     try:
@@ -252,7 +276,8 @@ def main():
                 continue
 
             try:
-                tenant_id, address_slug = parse_s3_context(key)
+                tenant_slug, address_slug = parse_s3_context(key)
+                tenant_id = resolve_tenant_id(cur, tenant_slug)
                 location_id, location_code = resolve_location(
                     cur, tenant_id, address_slug
                 )
