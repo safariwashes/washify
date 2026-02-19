@@ -75,13 +75,9 @@ def get_conn_with_retry(retries: int = 6, delay: int = 5):
 # HELPERS
 # =========================================================
 def parse_s3_context(key: str):
-    """
-    Expected S3 layout:
-      loader/tenant=<tenant_token>/address=<address_slug>/filename.txt
-    """
-    m = re.search(r"tenant=([^/]+)/address=([^/]+)/", key)
+    m = re.search(r"tenant=([^/]+)/location=([^/]+)/", key)
     if not m:
-        raise ValueError(f"Invalid S3 key (missing tenant/address): {key}")
+        raise ValueError(f"Invalid S3 key (missing tenant/location): {key}")
     return m.group(1), m.group(2)
 
 
@@ -118,23 +114,20 @@ def resolve_tenant_id(cur, tenant_slug: str):
     return row[0]
 
 
-def resolve_location(cur, tenant_id, address_slug: str):
-    """
-    Match slugified S3 address to locations.address
-    """
+def resolve_location(cur, tenant_id, location_code):
     cur.execute(
         """
         SELECT location_id, location_code
           FROM locations
          WHERE tenant_id = %s
-           AND lower(regexp_replace(address, '[^a-z0-9]+', '-', 'g')) = %s
+           AND location_code = %s
         """,
-        (tenant_id, (address_slug or "").lower()),
+        (tenant_id, location_code),
     )
     row = cur.fetchone()
     if not row:
         raise ValueError(
-            f"Location not found for tenant_id={tenant_id}, address_slug={address_slug}"
+            f"Location not found for tenant_id={tenant_id}, location_code={location_code}"
         )
     return row[0], row[1]
 
