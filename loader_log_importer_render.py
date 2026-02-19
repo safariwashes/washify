@@ -45,18 +45,18 @@ def get_conn_with_retry(retries=6, delay=5):
         except psycopg2.OperationalError as e:
             msg = str(e).lower()
             last_err = e
-            if (
+            transient = (
                 "recovery mode" in msg
                 or "not yet accepting connections" in msg
                 or "terminating connection" in msg
                 or "connection refused" in msg
-            ) and attempt < retries:
+            )
+            if transient and attempt < retries:
                 log.warning(f"DB unavailable ({attempt}/{retries}), retrying...")
                 time.sleep(delay)
                 continue
             raise
     raise last_err
-
 
 # =========================================================
 # HELPERS
@@ -67,13 +67,11 @@ def parse_s3_context(key):
         raise ValueError(f"Invalid S3 key (missing tenant/location): {key}")
     return m.group(1), m.group(2)
 
-
 def parse_ts(ts):
     try:
         return datetime.strptime(ts.strip(), "%m/%d/%Y %I:%M:%S %p")
     except Exception:
         return None
-
 
 def resolve_tenant_id(cur, tenant_slug):
     cur.execute(
@@ -84,7 +82,6 @@ def resolve_tenant_id(cur, tenant_slug):
     if not row:
         raise ValueError(f"Tenant not found for slug={tenant_slug}")
     return row[0]
-
 
 def resolve_location(cur, tenant_id, location_code):
     cur.execute(
@@ -103,6 +100,16 @@ def resolve_location(cur, tenant_id, location_code):
         )
     return row[0], row[1]
 
+def safe_execute(cur, sql, params):
+    cur.execute("SAVEPOINT line_sp")
+    try:
+        cur.execute(sql, params)
+        cur.execute("RELEASE SAVEPOINT line_sp")
+        return True
+    except Exception as e:
+        cur.execute("ROLLBACK TO SAVEPOINT line_sp")
+        log.warning(f"Line skipped due to DB error: {e}")
+        return False
 
 # =========================================================
 # CHECKPOINT (PERFORMANCE)
@@ -121,7 +128,6 @@ def get_checkpoint(cur, tenant_id, location_code, file_type):
     row = cur.fetchone()
     return row[0] if row else None
 
-
 def save_checkpoint(cur, tenant_id, location_code, file_type, ts):
     cur.execute(
         """
@@ -136,13 +142,11 @@ def save_checkpoint(cur, tenant_id, location_code, file_type, ts):
         (tenant_id, location_code, file_type, ts),
     )
 
-
 def write_heartbeat(cur, tenant_id, location_id):
     cur.execute(
         "INSERT INTO heartbeat (source, tenant_id, location_id) VALUES (%s,%s,%s)",
         (SOURCE_NAME, tenant_id, location_id),
     )
-
 
 # =========================================================
 # CONTROLLER LOG PROCESSOR
@@ -161,39 +165,41 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
             if not log_ts or (last_ts and log_ts <= last_ts):
                 continue
 
-            invoice_match = re.search(r"Invoice Id (\d+)", rest)
-            if not invoice_match:
+            inv_match = re.search(r"Invoice\s*Id\s*(\d+)", rest)
+            if not inv_match:
                 continue
 
-            invoice = int(invoice_match.group(1))
+            invoice = int(inv_match.group(1))
 
-            # BILL line
             if (
                 "Class=CommonFunctions" in rest
                 and "SendControllerCommandUsingCode" in rest
             ):
-                cur.execute(
+                safe_execute(
+                    cur,
                     """
                     INSERT INTO loader_controller_log
                     (tenant_id, location_id, location_code,
                      log_ts, bill, pos_receipt, source_file)
                     VALUES (%s,%s,%s,%s,%s,NULL,%s)
+                    ON CONFLICT DO NOTHING
                     """,
                     (tenant_id, location_id, location_code,
                      log_ts, invoice, key),
                 )
 
-            # POS RECEIPT line
             elif (
                 "Class=RTCController" in rest
                 and "CallRTCControllerByCode" in rest
             ):
-                cur.execute(
+                safe_execute(
+                    cur,
                     """
                     INSERT INTO loader_controller_log
                     (tenant_id, location_id, location_code,
                      log_ts, bill, pos_receipt, source_file)
                     VALUES (%s,%s,%s,%s,NULL,%s,%s)
+                    ON CONFLICT DO NOTHING
                     """,
                     (tenant_id, location_id, location_code,
                      log_ts, invoice, key),
@@ -207,7 +213,6 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
 
     if max_ts and max_ts != last_ts:
         save_checkpoint(cur, tenant_id, location_code, "CONTROLLER", max_ts)
-
 
 # =========================================================
 # TRANSACTION LOG PROCESSOR
@@ -226,15 +231,17 @@ def process_transaction_log(cur, tenant_id, location_id, location_code, key, lin
             if not log_ts or (last_ts and log_ts <= last_ts):
                 continue
 
-            inv = re.search(r"InvoiceId (\d+)", rest)
+            inv = re.search(r"Invoice\s*Id\s*(\d+)", rest)
             bill = int(inv.group(1)) if inv else None
 
-            cur.execute(
+            safe_execute(
+                cur,
                 """
                 INSERT INTO loader_transaction_log
                 (tenant_id, location_id, location_code,
                  log_ts, bill, raw_line, source_file)
                 VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT DO NOTHING
                 """,
                 (tenant_id, location_id, location_code,
                  log_ts, bill, rest.strip(), key),
@@ -248,7 +255,6 @@ def process_transaction_log(cur, tenant_id, location_id, location_code, key, lin
 
     if max_ts and max_ts != last_ts:
         save_checkpoint(cur, tenant_id, location_code, "TRANSACTION", max_ts)
-
 
 # =========================================================
 # MAIN
@@ -306,10 +312,9 @@ def main():
         conn.close()
         log.info("✅ Loader log importer completed")
 
-
 if __name__ == "__main__":
     try:
         main()
-    except psycopg2.OperationalError as e:
+    except psycopg2.OperationalError:
         log.error("DB unavailable — exiting")
         sys.exit(2)
