@@ -14,15 +14,14 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("loader-sequential")
+log = logging.getLogger("loader-log-importer")
 
 # =========================================================
 # CONFIG
 # =========================================================
-S3_BUCKET = "safari-franklin-data"
+S3_BUCKET = os.getenv("S3_BUCKET", "safari-franklin-data")
 S3_PREFIX = "loader/"
 AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
-
 SOURCE_NAME = "LoaderSequentialIngest"
 
 DB_PARAMS = dict(
@@ -36,81 +35,54 @@ DB_PARAMS = dict(
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 # =========================================================
-# DB CONNECTION (production-grade retry)
+# DB CONNECTION WITH RETRY
 # =========================================================
-def get_conn_with_retry(retries: int = 6, delay: int = 5):
-    """
-    Robust Postgres connection retry.
-    Handles recovery, restart, and transient Render outages.
-    """
+def get_conn_with_retry(retries=6, delay=5):
     last_err = None
-
     for attempt in range(1, retries + 1):
         try:
             return psycopg2.connect(**DB_PARAMS)
-
         except psycopg2.OperationalError as e:
             msg = str(e).lower()
             last_err = e
-
-            transient = (
+            if (
                 "recovery mode" in msg
                 or "not yet accepting connections" in msg
                 or "terminating connection" in msg
                 or "connection refused" in msg
-                or "could not connect to server" in msg
-            )
-
-            if transient and attempt < retries:
-                log.warning(f"DB unavailable (attempt {attempt}/{retries}), retrying in {delay}s")
+            ) and attempt < retries:
+                log.warning(f"DB unavailable ({attempt}/{retries}), retrying...")
                 time.sleep(delay)
                 continue
-
             raise
-
     raise last_err
 
 
 # =========================================================
 # HELPERS
 # =========================================================
-def parse_s3_context(key: str):
+def parse_s3_context(key):
     m = re.search(r"tenant=([^/]+)/location=([^/]+)/", key)
     if not m:
         raise ValueError(f"Invalid S3 key (missing tenant/location): {key}")
     return m.group(1), m.group(2)
 
 
-def parse_ts(ts: str):
+def parse_ts(ts):
     try:
         return datetime.strptime(ts.strip(), "%m/%d/%Y %I:%M:%S %p")
     except Exception:
         return None
 
 
-def resolve_tenant_id(cur, tenant_slug: str):
-    """
-    Resolve tenant_id using exact tenant_slug match.
-    This matches your existing PowerShell uploader
-    and avoids planner/tuple edge cases.
-    """
-    slug = (tenant_slug or "").strip().lower()
-    if not slug:
-        raise ValueError(f"Invalid tenant slug: {tenant_slug!r}")
-
+def resolve_tenant_id(cur, tenant_slug):
     cur.execute(
-        """
-        SELECT tenant_id
-          FROM tenants
-         WHERE tenant_slug = %s
-        """,
-        (slug,),
+        "SELECT tenant_id FROM tenants WHERE tenant_slug = %s",
+        (tenant_slug.lower(),),
     )
-
     row = cur.fetchone()
     if not row:
         raise ValueError(f"Tenant not found for slug={tenant_slug}")
-
     return row[0]
 
 
@@ -118,9 +90,9 @@ def resolve_location(cur, tenant_id, location_code):
     cur.execute(
         """
         SELECT location_id, location_code
-          FROM locations
-         WHERE tenant_id = %s
-           AND location_code = %s
+        FROM locations
+        WHERE tenant_id = %s
+          AND location_code = %s
         """,
         (tenant_id, location_code),
     )
@@ -132,14 +104,17 @@ def resolve_location(cur, tenant_id, location_code):
     return row[0], row[1]
 
 
+# =========================================================
+# CHECKPOINT (PERFORMANCE)
+# =========================================================
 def get_checkpoint(cur, tenant_id, location_code, file_type):
     cur.execute(
         """
         SELECT last_log_ts
-          FROM loader_file_checkpoint
-         WHERE tenant_id = %s
-           AND location_code = %s
-           AND file_type = %s
+        FROM loader_file_checkpoint
+        WHERE tenant_id = %s
+          AND location_code = %s
+          AND file_type = %s
         """,
         (tenant_id, location_code, file_type),
     )
@@ -154,9 +129,9 @@ def save_checkpoint(cur, tenant_id, location_code, file_type, ts):
             (tenant_id, location_code, file_type, last_log_ts)
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (tenant_id, location_code, file_type)
-        DO UPDATE
-           SET last_log_ts = EXCLUDED.last_log_ts,
-               updated_at = now()
+        DO UPDATE SET
+            last_log_ts = EXCLUDED.last_log_ts,
+            updated_at = now()
         """,
         (tenant_id, location_code, file_type, ts),
     )
@@ -164,18 +139,15 @@ def save_checkpoint(cur, tenant_id, location_code, file_type, ts):
 
 def write_heartbeat(cur, tenant_id, location_id):
     cur.execute(
-        """
-        INSERT INTO heartbeat (source, tenant_id, location_id)
-        VALUES (%s, %s, %s)
-        """,
+        "INSERT INTO heartbeat (source, tenant_id, location_id) VALUES (%s,%s,%s)",
         (SOURCE_NAME, tenant_id, location_id),
     )
 
 
 # =========================================================
-# PARSERS
+# CONTROLLER LOG PROCESSOR
 # =========================================================
-def process_controller_log(cur, tenant_id, location_code, key, lines):
+def process_controller_log(cur, tenant_id, location_id, location_code, key, lines):
     last_ts = get_checkpoint(cur, tenant_id, location_code, "CONTROLLER")
     max_ts = last_ts
 
@@ -189,29 +161,43 @@ def process_controller_log(cur, tenant_id, location_code, key, lines):
             if not log_ts or (last_ts and log_ts <= last_ts):
                 continue
 
-            m = re.search(r"Invoice Id (\d+)", rest)
-            if not m:
+            invoice_match = re.search(r"Invoice Id (\d+)", rest)
+            if not invoice_match:
                 continue
 
-            invoice_id = int(m.group(1))
+            invoice = int(invoice_match.group(1))
 
-            if "RTC True" in rest:
-                event_type = "RTC_TRUE"
-            elif "CallRTCControllerByCode" in rest:
-                event_type = "CALL_CONTROLLER"
-            else:
-                continue
+            # BILL line
+            if (
+                "Class=CommonFunctions" in rest
+                and "SendControllerCommandUsingCode" in rest
+            ):
+                cur.execute(
+                    """
+                    INSERT INTO loader_controller_log
+                    (tenant_id, location_id, location_code,
+                     log_ts, bill, pos_receipt, source_file)
+                    VALUES (%s,%s,%s,%s,%s,NULL,%s)
+                    """,
+                    (tenant_id, location_id, location_code,
+                     log_ts, invoice, key),
+                )
 
-            cur.execute(
-                """
-                INSERT INTO loader_controller_log
-                    (tenant_id, location_code, log_ts,
-                     event_type, invoice_id, source_file)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-                """,
-                (tenant_id, location_code, log_ts, event_type, invoice_id, key),
-            )
+            # POS RECEIPT line
+            elif (
+                "Class=RTCController" in rest
+                and "CallRTCControllerByCode" in rest
+            ):
+                cur.execute(
+                    """
+                    INSERT INTO loader_controller_log
+                    (tenant_id, location_id, location_code,
+                     log_ts, bill, pos_receipt, source_file)
+                    VALUES (%s,%s,%s,%s,NULL,%s,%s)
+                    """,
+                    (tenant_id, location_id, location_code,
+                     log_ts, invoice, key),
+                )
 
             if not max_ts or log_ts > max_ts:
                 max_ts = log_ts
@@ -223,7 +209,10 @@ def process_controller_log(cur, tenant_id, location_code, key, lines):
         save_checkpoint(cur, tenant_id, location_code, "CONTROLLER", max_ts)
 
 
-def process_transaction_log(cur, tenant_id, location_code, key, lines):
+# =========================================================
+# TRANSACTION LOG PROCESSOR
+# =========================================================
+def process_transaction_log(cur, tenant_id, location_id, location_code, key, lines):
     last_ts = get_checkpoint(cur, tenant_id, location_code, "TRANSACTION")
     max_ts = last_ts
 
@@ -237,29 +226,18 @@ def process_transaction_log(cur, tenant_id, location_code, key, lines):
             if not log_ts or (last_ts and log_ts <= last_ts):
                 continue
 
-            cls = re.search(r"Class=([^,]+)", rest)
-            mth = re.search(r"Method=([^,]+)", rest)
-            msg = re.search(r"Message=(.*)", rest)
             inv = re.search(r"InvoiceId (\d+)", rest)
+            bill = int(inv.group(1)) if inv else None
 
             cur.execute(
                 """
                 INSERT INTO loader_transaction_log
-                    (tenant_id, location_code, log_ts,
-                     class_name, method_name, message,
-                     invoice_id, source_file)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (tenant_id, location_id, location_code,
+                 log_ts, bill, raw_line, source_file)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
                 """,
-                (
-                    tenant_id,
-                    location_code,
-                    log_ts,
-                    cls.group(1) if cls else None,
-                    mth.group(1) if mth else None,
-                    msg.group(1) if msg else None,
-                    int(inv.group(1)) if inv else None,
-                    key,
-                ),
+                (tenant_id, location_id, location_code,
+                 log_ts, bill, rest.strip(), key),
             )
 
             if not max_ts or log_ts > max_ts:
@@ -276,7 +254,7 @@ def process_transaction_log(cur, tenant_id, location_code, key, lines):
 # MAIN
 # =========================================================
 def main():
-    log.info("🚀 Loader sequential ingestion started")
+    log.info("🚀 Loader log importer started")
 
     conn = get_conn_with_retry()
     cur = conn.cursor()
@@ -289,15 +267,16 @@ def main():
             if not key.lower().endswith(".txt"):
                 continue
 
-            # Optional guard: only process known file types
             k = key.lower()
-            if ("controllerlog" not in k) and ("transactionlog" not in k):
+            if "controllerlog" not in k and "transactionlog" not in k:
                 continue
 
             try:
-                tenant_token, address_slug = parse_s3_context(key)
-                tenant_id = resolve_tenant_id(cur, tenant_token)
-                location_id, location_code = resolve_location(cur, tenant_id, address_slug)
+                tenant_slug, location_code = parse_s3_context(key)
+                tenant_id = resolve_tenant_id(cur, tenant_slug)
+                location_id, location_code = resolve_location(
+                    cur, tenant_id, location_code
+                )
 
                 body = (
                     s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"]
@@ -307,12 +286,13 @@ def main():
                 lines = body.splitlines()
 
                 if "controllerlog" in k:
-                    log.info(f"📄 ControllerLog → {key}")
-                    process_controller_log(cur, tenant_id, location_code, key, lines)
-
-                elif "transactionlog" in k:
-                    log.info(f"📄 TransactionLog → {key}")
-                    process_transaction_log(cur, tenant_id, location_code, key, lines)
+                    process_controller_log(
+                        cur, tenant_id, location_id, location_code, key, lines
+                    )
+                else:
+                    process_transaction_log(
+                        cur, tenant_id, location_id, location_code, key, lines
+                    )
 
                 write_heartbeat(cur, tenant_id, location_id)
                 conn.commit()
@@ -322,23 +302,14 @@ def main():
                 log.error(f"❌ Failed processing {key}: {e}")
 
     finally:
-        try:
-            cur.close()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
-        log.info("✅ Loader sequential ingestion completed")
+        cur.close()
+        conn.close()
+        log.info("✅ Loader log importer completed")
 
 
 if __name__ == "__main__":
     try:
         main()
     except psycopg2.OperationalError as e:
-        msg = str(e).lower()
-        if "recovery mode" in msg or "not yet accepting connections" in msg:
-            log.error("DB unavailable — exiting, will retry next run")
-            sys.exit(2)
-        raise
+        log.error("DB unavailable — exiting")
+        sys.exit(2)
