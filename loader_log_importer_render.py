@@ -162,7 +162,7 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
         try:
             ts_raw, rest = line.split(",", 1)
             log_ts = parse_ts(ts_raw)
-            if not log_ts or (last_ts and log_ts <= last_ts):
+            if not log_ts or (last_ts and log_ts < last_ts):
                 continue
 
             m = re.search(r"Invoice Id (\d+)", rest)
@@ -242,23 +242,40 @@ def process_transaction_log(cur, tenant_id, location_id, location_code, key, lin
         try:
             ts_raw, rest = line.split(",", 1)
             log_ts = parse_ts(ts_raw)
-            if not log_ts or (last_ts and log_ts <= last_ts):
+
+            # ✅ allow same timestamp, skip only older
+            if not log_ts or (last_ts and log_ts < last_ts):
                 continue
 
-            inv = re.search(r"Invoice\s*Id\s*(\d+)", rest)
+            # Invoice Id is OPTIONAL in TransactionLog
+            inv = re.search(r"Invoice\s*Id\s*(\d+)", rest, re.IGNORECASE)
             bill = int(inv.group(1)) if inv else None
 
             safe_execute(
                 cur,
                 """
                 INSERT INTO loader_transaction_log
-                (tenant_id, location_id, location_code,
-                 log_ts, bill, raw_line, source_file)
+                (
+                    tenant_id,
+                    location_id,
+                    location_code,
+                    log_ts,
+                    bill,
+                    raw_line,
+                    source_file
+                )
                 VALUES (%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT DO NOTHING
                 """,
-                (tenant_id, location_id, location_code,
-                 log_ts, bill, rest.strip(), key),
+                (
+                    tenant_id,
+                    location_id,
+                    location_code,
+                    log_ts,
+                    bill,                 -- may be NULL (this is OK)
+                    rest.strip(),
+                    key,
+                ),
             )
 
             if not max_ts or log_ts > max_ts:
@@ -269,7 +286,6 @@ def process_transaction_log(cur, tenant_id, location_id, location_code, key, lin
 
     if max_ts and max_ts != last_ts:
         save_checkpoint(cur, tenant_id, location_code, "TRANSACTION", max_ts)
-
 # =========================================================
 # MAIN
 # =========================================================
