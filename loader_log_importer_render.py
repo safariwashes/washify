@@ -165,12 +165,13 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
             if not log_ts or (last_ts and log_ts <= last_ts):
                 continue
 
-            inv_match = re.search(r"Invoice\s*Id\s*(\d+)", rest)
-            if not inv_match:
+            m = re.search(r"Invoice Id (\d+)", rest)
+            if not m:
                 continue
 
-            invoice = int(inv_match.group(1))
+            invoice = int(m.group(1))
 
+            # BILL (from POS → controller)
             if (
                 "Class=CommonFunctions" in rest
                 and "SendControllerCommandUsingCode" in rest
@@ -184,10 +185,17 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
                     VALUES (%s,%s,%s,%s,%s,NULL,%s)
                     ON CONFLICT DO NOTHING
                     """,
-                    (tenant_id, location_id, location_code,
-                     log_ts, invoice, key),
+                    (
+                        tenant_id,
+                        location_id,
+                        location_code,
+                        log_ts,
+                        invoice,
+                        key,
+                    ),
                 )
 
+            # POS RECEIPT (controller → hardware)
             elif (
                 "Class=RTCController" in rest
                 and "CallRTCControllerByCode" in rest
@@ -201,8 +209,14 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
                     VALUES (%s,%s,%s,%s,NULL,%s,%s)
                     ON CONFLICT DO NOTHING
                     """,
-                    (tenant_id, location_id, location_code,
-                     log_ts, invoice, key),
+                    (
+                        tenant_id,
+                        location_id,
+                        location_code,
+                        log_ts,
+                        invoice,
+                        key,
+                    ),
                 )
 
             if not max_ts or log_ts > max_ts:
