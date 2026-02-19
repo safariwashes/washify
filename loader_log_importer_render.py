@@ -92,33 +92,29 @@ def parse_ts(ts: str):
         return None
 
 
-def resolve_tenant_id(cur, tenant_token: str):
+def resolve_tenant_id(cur, tenant_slug: str):
     """
-    Resolve tenant_id from S3 tenant token (e.g. 'safariexpresswash') without:
-      - tenant_alias table
-      - hardcoding tenant_id
-
-    Strategy:
-      - Normalize both token + tenant_slug to alnum-only
-      - Choose the most specific tenant_slug that matches as a prefix
+    Resolve tenant_id using exact tenant_slug match.
+    This matches your existing PowerShell uploader
+    and avoids planner/tuple edge cases.
     """
-    token_norm = re.sub(r"[^a-z0-9]+", "", (tenant_token or "").lower()).strip()
-    if not token_norm:
-        raise ValueError(f"Bad tenant token: {tenant_token!r}")
+    slug = (tenant_slug or "").strip().lower()
+    if not slug:
+        raise ValueError(f"Invalid tenant slug: {tenant_slug!r}")
 
     cur.execute(
         """
-        SELECT tenant_id, tenant_slug
+        SELECT tenant_id
           FROM tenants
-         WHERE %s LIKE regexp_replace(lower(tenant_slug), '[^a-z0-9]+', '', 'g') || '%'
-         ORDER BY length(tenant_slug) DESC
-         LIMIT 1
+         WHERE tenant_slug = %s
         """,
-        (token_norm,),
+        (slug,),
     )
+
     row = cur.fetchone()
     if not row:
-        raise ValueError(f"Tenant not found for token={tenant_token}")
+        raise ValueError(f"Tenant not found for slug={tenant_slug}")
+
     return row[0]
 
 
