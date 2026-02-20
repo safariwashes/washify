@@ -203,18 +203,18 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
                 safe_execute(
                     cur,
                     """
-                    INSERT INTO loader_controller_log
-                    (tenant_id, location_id, location_code,
-                     log_ts, bill, pos_receipt, source_file)
-                    VALUES (%s,%s,%s,%s,NULL,%s,%s)
+                    UPDATE loader_controller_log
+                     SET pos_receipt = %s
+                     WHERE tenant_id = %s
+                     AND location_id = %s
+                     AND source_file = %s
+                     AND bill IS NOT NULL
                     ON CONFLICT DO NOTHING
                     """,
                     (
+                        invoice,          # POS receipt
                         tenant_id,
                         location_id,
-                        location_code,
-                        log_ts,
-                        invoice,
                         key,
                     ),
                 )
@@ -248,8 +248,8 @@ def process_transaction_log(cur, tenant_id, location_id, location_code, key, lin
                 continue
 
             # Invoice Id is OPTIONAL in TransactionLog
-            inv = re.search(r"Invoice\s*Id\s*(\d+)", rest, re.IGNORECASE)
-            bill = int(inv.group(1)) if inv else None
+            inv = re.search(r"Invoice\s*Id\s*(\d+)|InvoiceId\s*(\d+)", rest, re.IGNORECASE)
+            bill = int(inv.group(1) or inv.group(2)) if inv else None
 
             safe_execute(
                 cur,
