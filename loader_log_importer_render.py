@@ -58,6 +58,7 @@ def get_conn_with_retry(retries=6, delay=5):
             raise
     raise last_err
 
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -67,11 +68,13 @@ def parse_s3_context(key):
         raise ValueError(f"Invalid S3 key (missing tenant/location): {key}")
     return m.group(1), m.group(2)
 
+
 def parse_ts(ts):
     try:
         return datetime.strptime(ts.strip(), "%m/%d/%Y %I:%M:%S %p")
     except Exception:
         return None
+
 
 def resolve_tenant_id(cur, tenant_slug):
     cur.execute(
@@ -82,6 +85,7 @@ def resolve_tenant_id(cur, tenant_slug):
     if not row:
         raise ValueError(f"Tenant not found for slug={tenant_slug}")
     return row[0]
+
 
 def resolve_location(cur, tenant_id, location_code):
     cur.execute(
@@ -100,6 +104,7 @@ def resolve_location(cur, tenant_id, location_code):
         )
     return row[0], row[1]
 
+
 def safe_execute(cur, sql, params):
     cur.execute("SAVEPOINT line_sp")
     try:
@@ -111,8 +116,9 @@ def safe_execute(cur, sql, params):
         log.warning(f"Line skipped due to DB error: {e}")
         return False
 
+
 # =========================================================
-# CHECKPOINT (PERFORMANCE)
+# CHECKPOINT
 # =========================================================
 def get_checkpoint(cur, tenant_id, location_code, file_type):
     cur.execute(
@@ -128,6 +134,7 @@ def get_checkpoint(cur, tenant_id, location_code, file_type):
     row = cur.fetchone()
     return row[0] if row else None
 
+
 def save_checkpoint(cur, tenant_id, location_code, file_type, ts):
     cur.execute(
         """
@@ -142,11 +149,13 @@ def save_checkpoint(cur, tenant_id, location_code, file_type, ts):
         (tenant_id, location_code, file_type, ts),
     )
 
+
 def write_heartbeat(cur, tenant_id, location_id):
     cur.execute(
         "INSERT INTO heartbeat (source, tenant_id, location_id) VALUES (%s,%s,%s)",
         (SOURCE_NAME, tenant_id, location_id),
     )
+
 
 # =========================================================
 # CONTROLLER LOG PROCESSOR
@@ -162,6 +171,7 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
         try:
             ts_raw, rest = line.split(",", 1)
             log_ts = parse_ts(ts_raw)
+
             if not log_ts or (last_ts and log_ts < last_ts):
                 continue
 
@@ -171,7 +181,7 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
 
             invoice = int(m.group(1))
 
-            # BILL (from POS → controller)
+            # INSERT BILL
             if (
                 "Class=CommonFunctions" in rest
                 and "SendControllerCommandUsingCode" in rest
@@ -195,7 +205,7 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
                     ),
                 )
 
-            # POS RECEIPT (controller → hardware)
+            # UPDATE POS RECEIPT (safe single-row update)
             elif (
                 "Class=RTCController" in rest
                 and "CallRTCControllerByCode" in rest
@@ -204,17 +214,21 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
                     cur,
                     """
                     UPDATE loader_controller_log
-                     SET pos_receipt = %s
-                     WHERE tenant_id = %s
-                     AND location_id = %s
-                     AND source_file = %s
-                     AND bill IS NOT NULL
-                     AND ABS(EXTRACT(EPOCH FROM (log_ts - %s))) <= 2
-                     ORDER BY log_ts DESC
-                     LIMIT 1
+                       SET pos_receipt = %s
+                     WHERE ctid IN (
+                           SELECT ctid
+                             FROM loader_controller_log
+                            WHERE tenant_id = %s
+                              AND location_id = %s
+                              AND source_file = %s
+                              AND bill IS NOT NULL
+                              AND ABS(EXTRACT(EPOCH FROM (log_ts - %s))) <= 2
+                            ORDER BY log_ts DESC
+                            LIMIT 1
+                       )
                     """,
                     (
-                        invoice,          # POS receipt
+                        invoice,
                         tenant_id,
                         location_id,
                         key,
@@ -231,6 +245,7 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
     if max_ts and max_ts != last_ts:
         save_checkpoint(cur, tenant_id, location_code, "CONTROLLER", max_ts)
 
+
 # =========================================================
 # TRANSACTION LOG PROCESSOR
 # =========================================================
@@ -246,27 +261,22 @@ def process_transaction_log(cur, tenant_id, location_id, location_code, key, lin
             ts_raw, rest = line.split(",", 1)
             log_ts = parse_ts(ts_raw)
 
-            # ✅ allow same timestamp, skip only older
             if not log_ts or (last_ts and log_ts < last_ts):
                 continue
 
-            # Invoice Id is OPTIONAL in TransactionLog
-            inv = re.search(r"Invoice\s*Id\s*(\d+)|InvoiceId\s*(\d+)", rest, re.IGNORECASE)
+            inv = re.search(
+                r"Invoice\s*Id\s*(\d+)|InvoiceId\s*(\d+)",
+                rest,
+                re.IGNORECASE,
+            )
             bill = int(inv.group(1) or inv.group(2)) if inv else None
 
             safe_execute(
                 cur,
                 """
                 INSERT INTO loader_transaction_log
-                (
-                    tenant_id,
-                    location_id,
-                    location_code,
-                    log_ts,
-                    bill,
-                    raw_line,
-                    source_file
-                )
+                (tenant_id, location_id, location_code,
+                 log_ts, bill, raw_line, source_file)
                 VALUES (%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT DO NOTHING
                 """,
@@ -275,7 +285,7 @@ def process_transaction_log(cur, tenant_id, location_id, location_code, key, lin
                     location_id,
                     location_code,
                     log_ts,
-                    bill,                 -- may be NULL (this is OK)
+                    bill,
                     rest.strip(),
                     key,
                 ),
@@ -289,6 +299,8 @@ def process_transaction_log(cur, tenant_id, location_id, location_code, key, lin
 
     if max_ts and max_ts != last_ts:
         save_checkpoint(cur, tenant_id, location_code, "TRANSACTION", max_ts)
+
+
 # =========================================================
 # MAIN
 # =========================================================
@@ -344,6 +356,7 @@ def main():
         cur.close()
         conn.close()
         log.info("✅ Loader log importer completed")
+
 
 if __name__ == "__main__":
     try:
