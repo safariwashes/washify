@@ -209,13 +209,16 @@ def process_controller_log(cur, tenant_id, location_id, location_code, key, line
                      AND location_id = %s
                      AND source_file = %s
                      AND bill IS NOT NULL
-                    ON CONFLICT DO NOTHING
+                     AND ABS(EXTRACT(EPOCH FROM (log_ts - %s))) <= 2
+                     ORDER BY log_ts DESC
+                     LIMIT 1
                     """,
                     (
                         invoice,          # POS receipt
                         tenant_id,
                         location_id,
                         key,
+                        log_ts,
                     ),
                 )
 
